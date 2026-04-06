@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "graph-brain"
+version = "0.1.0"
+description = "Neuromorphic graph architecture - self-organizing directed graph computation"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.4",
+    "pydantic>=2.0",
+    "omegaconf>=2.3",
+    "numpy>=1.24",
+    "pyyaml>=6.0",
+    "matplotlib>=3.7",
+    "pyqtgraph>=0.13",
+    "PyQt6>=6.5",
+    "pyopengl>=3.1",
+    "h5py>=3.9",
+    "rich>=13.0",
+    "pandas>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-timeout>=2.1",
+    "pytest-cov>=4.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 30
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "gpu: marks tests requiring CUDA GPU",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["graph_brain*"]

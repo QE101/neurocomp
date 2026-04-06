@@ -1,0 +1,16 @@
+nodes:
+  n_excitatory: 80
+  n_pv: 7
+  n_sst: 7
+  n_vip: 6
+
+simulation:
+  seed: 42
+  n_steps: 100
+  record_interval: 1
+  device: cpu
+  log_interval: 10
+  checkpoint_interval: 50
+
+viz:
+  enabled: false

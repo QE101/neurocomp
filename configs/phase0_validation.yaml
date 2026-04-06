@@ -1,0 +1,24 @@
+# Phase 0.3 Validation Sweep Configuration
+# Smaller graph (N=100) for fast sweep, key params varied
+
+nodes:
+  n_excitatory: 80
+  n_pv: 7
+  n_sst: 7
+  n_vip: 6
+
+simulation:
+  device: cpu
+  seed: 42
+  n_steps: 2000
+  record_interval: 10
+
+viz:
+  enabled: false
+
+# Sweep dimensions (used by run_sweep.py):
+# edges.stdp.learning_rate: [0.001, 0.005, 0.01, 0.02, 0.05]
+# edges.stdp.a_minus: [0.005, 0.00525, 0.0055, 0.006]
+# nodes.noise_std: [0.001, 0.005, 0.01, 0.05]
+# edges.connectivity.inhib_perisomatic.p_max: [0.3, 0.5, 0.7]
+# nodes.ip_learning_rate: [0.0, 0.0001, 0.001]

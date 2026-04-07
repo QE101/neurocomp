@@ -41,6 +41,7 @@ from graph_brain.oscillations import ThetaDrive
 from graph_brain.hierarchy import HierarchyBuilder
 from graph_brain.hippocampus import HippocampalSystem
 from graph_brain.types import EdgeType, NodeType
+from graph_brain.engine.fused_plasticity import FusedPlasticity, _node_core
 
 BASELINE = math.log(2)
 N_EPOCHS = 1000
@@ -79,7 +80,11 @@ _noise_buf = None
 _noise_idx = 0
 _noise_size = 100
 _exc_mask = _pv_mask = _sst_mask = _vip_mask = _exc_f = None
+_inh_mask = _inh_f = _pv_f = None
 _current_decay = 0.999  # initial decay rate, will adapt
+_fused = None  # FusedPlasticity instance
+_compiled_node = None  # compiled node update (None on Windows)
+_basal_tau = _apical_tau = _input_norm = None  # pre-computed tau tensors
 
 
 def precompute_edge_data(graph, mp):
@@ -107,11 +112,15 @@ def get_noise(N):
 
 def cache_type_masks(ns):
     global _exc_mask, _pv_mask, _sst_mask, _vip_mask, _exc_f
+    global _inh_mask, _inh_f, _pv_f
     _exc_mask = ns.type_mask(NodeType.EXCITATORY)
     _pv_mask = ns.type_mask(NodeType.PV)
     _sst_mask = ns.type_mask(NodeType.SST)
     _vip_mask = ns.type_mask(NodeType.VIP)
     _exc_f = _exc_mask.float()
+    _inh_mask = ~_exc_mask
+    _inh_f = _inh_mask.float()
+    _pv_f = _pv_mask.float()
 
 def get_presentation_steps(epoch):
     if epoch < 300: return 100
@@ -164,38 +173,44 @@ CONFIG_50K = {
 # TRUE SILENCE node dynamics
 # ================================================================
 def error_node_update(ns, inputs, theta_mod=1.0, tau_mult=None):
-    device = ns.device
     N = ns.n_nodes
-    exc_mask, pv_mask, sst_mask, vip_mask, exc_f = _exc_mask, _pv_mask, _sst_mask, _vip_mask, _exc_f
-    if tau_mult is not None:
-        basal_tau = 10.0 * tau_mult
-        apical_tau = 20.0 * tau_mult
-        input_norm = 1.0 / tau_mult
+    if _compiled_node is not None and _basal_tau is not None:
+        # Compiled path (WSL) — single fused kernel
+        noise = get_noise(N)
+        ns.basal, ns.apical, ns.output, ns.prediction_error, ns.activity_ema = _compiled_node(
+            ns.basal, ns.apical, ns.output, ns.prediction_error, ns.gain, ns.activity_ema,
+            inputs.basal, inputs.apical, inputs.sst_inhibition, inputs.pv_inhibition,
+            inputs.electrical, inputs.vip_inhibition,
+            _exc_mask, _exc_f, _inh_mask, _inh_f, _sst_mask, _pv_f,
+            _basal_tau, _apical_tau, _input_norm, theta_mod, noise)
     else:
-        basal_tau = 10.0
-        apical_tau = 20.0
-        input_norm = 1.0
-    ns.basal += 1.0 * (-ns.basal / basal_tau + inputs.basal * theta_mod * input_norm) * exc_f
-    sst_gate = torch.sigmoid(inputs.sst_inhibition * 5.0)
-    ns.apical += 1.0 * (-ns.apical / apical_tau + inputs.apical * (1.0 - sst_gate) * input_norm) * exc_f
-    pred_err = ns.basal - ns.apical
-    pv_gain = torch.clamp(1.0 - inputs.pv_inhibition, min=0.0, max=1.0)
-    raw = F.softplus(pred_err.abs()) - BASELINE
-    ns.output = torch.where(exc_mask, raw.clamp(min=0.0, max=10.0) * pv_gain * ns.gain, ns.output)
-    ns.prediction_error = torch.where(exc_mask, pred_err, ns.prediction_error)
-    for inh_type, mask in [(NodeType.PV, pv_mask), (NodeType.SST, sst_mask), (NodeType.VIP, vip_mask)]:
-        f = mask.float()
-        inp = inputs.basal + (inputs.electrical if inh_type == NodeType.PV else torch.zeros_like(inputs.basal))
-        ns.basal += 1.0 * (-ns.basal / 10.0 + inp) * f
+        # Eager path (Windows fallback)
+        if tau_mult is not None:
+            basal_tau = 10.0 * tau_mult
+            apical_tau = 20.0 * tau_mult
+            input_norm = 1.0 / tau_mult
+        else:
+            basal_tau = 10.0
+            apical_tau = 20.0
+            input_norm = 1.0
+        ns.basal += 1.0 * (-ns.basal / basal_tau + inputs.basal * theta_mod * input_norm) * _exc_f
+        sst_gate = torch.sigmoid(inputs.sst_inhibition * 5.0)
+        ns.apical += 1.0 * (-ns.apical / apical_tau + inputs.apical * (1.0 - sst_gate) * input_norm) * _exc_f
+        pred_err = ns.basal - ns.apical
+        pv_gain = torch.clamp(1.0 - inputs.pv_inhibition, min=0.0, max=1.0)
+        raw = F.softplus(pred_err.abs()) - BASELINE
+        ns.output = torch.where(_exc_mask, raw.clamp(min=0.0, max=10.0) * pv_gain * ns.gain, ns.output)
+        ns.prediction_error = torch.where(_exc_mask, pred_err, ns.prediction_error)
+        inh_input = inputs.basal + inputs.electrical * _pv_f
+        ns.basal += (-ns.basal / 10.0 + inh_input) * _inh_f
         inh_raw = F.softplus(ns.basal) - BASELINE
-        out = inh_raw.clamp(min=0.0, max=10.0) * ns.gain * f
-        if inh_type == NodeType.SST:
-            sst_suppress = torch.clamp(1.0 - inputs.sst_inhibition - inputs.vip_inhibition, min=0.0, max=1.0)
-            out = out * sst_suppress
-        ns.output = torch.where(mask, out, ns.output)
-    ns.output += get_noise(N)
-    ns.output.clamp_(min=0.0, max=10.0)
-    ns.activity_ema.lerp_(ns.output, 1.0 / 1000.0)
+        inh_out = inh_raw.clamp(0.0, 10.0) * ns.gain * _inh_f
+        sst_suppress = torch.clamp(1.0 - inputs.sst_inhibition - inputs.vip_inhibition, 0.0, 1.0)
+        inh_out = torch.where(_sst_mask, inh_out * sst_suppress, inh_out)
+        ns.output = torch.where(_inh_mask, inh_out, ns.output)
+        ns.output += get_noise(N)
+        ns.output.clamp_(min=0.0, max=10.0)
+        ns.activity_ema.lerp_(ns.output, 1.0 / 1000.0)
 
 
 def dual_channel_send(ns, graph, mp, device):
@@ -219,6 +234,8 @@ def dual_channel_send(ns, graph, mp, device):
         store = graph.edge_store(EdgeType.ELECTRICAL)
         gap = store.weight * (output[cache['src64']] - output[cache['dst64']])
         mp.delay_buffer.write(Channel.ELECTRICAL, store.dst, gap, cache['delay_steps'], step)
+
+
 
 
 # ================================================================
@@ -410,9 +427,7 @@ def discover_l2_representations(symbols, graph, ns, mp, device, theta, stp, hom,
             inputs = mp.read_inputs(step)
             inputs.basal[pattern.long()] += 2.0
             error_node_update(ns, inputs, theta_mod=theta.get_modulation(step), tau_mult=tau_mult)
-            for et in PLASTIC_EDGE_TYPES:
-                if graph.has_edge_type(et):
-                    stp.update(graph.edge_store(et), ns, 1.0)
+            _fused.stp(ns.output)
             if step % 100 == 0:
                 for et in PLASTIC_EDGE_TYPES:
                     if graph.has_edge_type(et):
@@ -458,9 +473,7 @@ def measure_apical_l1(pred_name, target_name, symbols, graph, ns, mp, device,
         inputs = mp.read_inputs(step)
         inputs.basal[pred_nodes.long()] += 2.0
         error_node_update(ns, inputs, theta_mod=theta.get_modulation(step), tau_mult=tau_mult)
-        for et in PLASTIC_EDGE_TYPES:
-            if graph.has_edge_type(et):
-                stp.update(graph.edge_store(et), ns, 1.0)
+        _fused.stp(ns.output)
         if step % 100 == 0:
             for et in PLASTIC_EDGE_TYPES:
                 if graph.has_edge_type(et):
@@ -489,9 +502,7 @@ def measure_apical_l2(pred_name, target_name, symbols, l2_reps, graph, ns, mp, d
         inputs = mp.read_inputs(step)
         inputs.basal[pred_nodes.long()] += 2.0
         error_node_update(ns, inputs, theta_mod=theta.get_modulation(step), tau_mult=tau_mult)
-        for et in PLASTIC_EDGE_TYPES:
-            if graph.has_edge_type(et):
-                stp.update(graph.edge_store(et), ns, 1.0)
+        _fused.stp(ns.output)
         if step % 100 == 0:
             for et in PLASTIC_EDGE_TYPES:
                 if graph.has_edge_type(et):
@@ -709,6 +720,45 @@ def main():
         precompute_edge_data(graph, mp)
         print(f'  Resumed at epoch {start_epoch}, decay={_current_decay:.6f}', flush=True)
 
+    # Build fused plasticity (after potential checkpoint restore)
+    global _fused
+    _fused = FusedPlasticity(graph, config.edges.stp, mp.delay_buffer)
+    print(f'  Fused plasticity: {_fused.n_total:,} edges in {len(_fused.active_types)} types', flush=True)
+
+    # torch.compile: ~1.8x on top of fusion (Linux/WSL only)
+    _fused.enable_compile()
+
+    # Compiled node update
+    global _compiled_node, _basal_tau, _apical_tau, _input_norm
+    if tau_mult is not None:
+        _basal_tau = 10.0 * tau_mult
+        _apical_tau = 20.0 * tau_mult
+        _input_norm = 1.0 / tau_mult
+    else:
+        _basal_tau = torch.tensor(10.0, device=device)
+        _apical_tau = torch.tensor(20.0, device=device)
+        _input_norm = torch.tensor(1.0, device=device)
+    if sys.platform != 'win32':
+        try:
+            _compiled_node = torch.compile(_node_core, mode='default')
+            # Warmup
+            _noise = torch.randn(N, device=device) * 0.005
+            _compiled_node(
+                ns.basal.clone(), ns.apical.clone(), ns.output.clone(),
+                ns.prediction_error.clone(), ns.gain, ns.activity_ema.clone(),
+                torch.zeros(N, device=device), torch.zeros(N, device=device),
+                torch.zeros(N, device=device), torch.zeros(N, device=device),
+                torch.zeros(N, device=device), torch.zeros(N, device=device),
+                _exc_mask, _exc_f, _inh_mask, _inh_f, _sst_mask, _pv_f,
+                _basal_tau, _apical_tau, _input_norm, 1.0, _noise)
+            torch.cuda.synchronize()
+            print('  [compile] node update compiled', flush=True)
+        except Exception as e:
+            print(f'  [compile] node update failed: {e}', flush=True)
+            _compiled_node = None
+    else:
+        _compiled_node = None
+
     day_names = sequences['days']
     digit_names = sequences['digits']
     seq_keys = list(sequences.keys())
@@ -755,10 +805,8 @@ def main():
                     inputs = mp.read_inputs(step)
                     inputs.basal[pattern.long()] += strength
                     error_node_update(ns, inputs, theta_mod=theta.get_modulation(step), tau_mult=tau_mult)
-                    for et in PLASTIC_EDGE_TYPES:
-                        if graph.has_edge_type(et):
-                            stp.update(graph.edge_store(et), ns, 1.0)
-                    apply_memory_learning(graph, lr_scale=1.0, is_replay=False)
+                    _fused.stp(ns.output)
+                    _fused.learn(ns, _exc_mask, _current_decay, is_replay=False)
                     if step % 100 == 0:
                         for et in PLASTIC_EDGE_TYPES:
                             if graph.has_edge_type(et):
@@ -788,7 +836,7 @@ def main():
                     inputs = mp.read_inputs(step)
                     inputs.basal[all_symbol_nodes.long()] += replay
                     error_node_update(ns, inputs, theta_mod=1.0, tau_mult=tau_mult)
-                    apply_memory_learning(graph, lr_scale=1.0, is_replay=True)
+                    _fused.learn(ns, _exc_mask, _current_decay, is_replay=True)
                     graph.increment_step()
 
             # Sharp-wave ripples
@@ -801,7 +849,7 @@ def main():
                     inputs = mp.read_inputs(step)
                     inputs.basal[all_symbol_nodes.long()] += replay * 2.0
                     error_node_update(ns, inputs, theta_mod=1.0, tau_mult=tau_mult)
-                    apply_memory_learning(graph, lr_scale=3.0, is_replay=True)
+                    _fused.learn(ns, _exc_mask, _current_decay, is_replay=True, lr_scale=3.0)
                     graph.increment_step()
 
             # Homeostatic downscaling with memory protection
@@ -817,6 +865,7 @@ def main():
             if sp_stats['grown'] > 0 or sp_stats['pruned'] > 0:
                 print(f'  SP ep{epoch+1}: +{sp_stats["grown"]} -{sp_stats["pruned"]}', flush=True)
                 precompute_edge_data(graph, mp)
+                _fused.rebuild(graph, mp.delay_buffer)
 
         # Measure
         if (epoch + 1) % MEASURE_EVERY == 0:
@@ -883,10 +932,8 @@ def main():
                 inputs = mp.read_inputs(step)
                 inputs.basal[pattern.long()] += get_strength()
                 error_node_update(ns, inputs, theta_mod=theta.get_modulation(step), tau_mult=tau_mult)
-                for et in PLASTIC_EDGE_TYPES:
-                    if graph.has_edge_type(et):
-                        stp.update(graph.edge_store(et), ns, 1.0)
-                apply_memory_learning(graph, lr_scale=1.0, is_replay=False)
+                _fused.stp(ns.output)
+                _fused.learn(ns, _exc_mask, _current_decay, is_replay=False)
                 graph.increment_step()
 
         # Adapt during transfer too

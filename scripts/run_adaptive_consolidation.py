@@ -845,7 +845,7 @@ def main():
         n_lv = lv_idx.shape[0]
         tau = config.hierarchy.time_scale_factor ** (lv - 1)
         print(f'    L{lv}: {n_lv:,} nodes (tau={tau:.0f}x)', flush=True)
-        if lv >= 3:  # readout from L3+
+        if lv >= 2:  # readout from L2+
             top_k = min(200, n_lv // 3)  # scale top_k to level size
             readout_levels[lv] = (lv_idx, top_k)
             print(f'      -> readout enabled (top_k={top_k})', flush=True)
@@ -1047,21 +1047,22 @@ def main():
             print(f'  Ep {epoch+1:5d} ({pd_steps}st):', flush=True)
 
             for pname, pseq in probe_sequences.items():
-                l1_a, l1_d, l2_a, l2_d = measure_discrimination_dual(
+                l1_a, l1_d, l3_a, l3_d = measure_discrimination_dual(
                     symbols, pseq, l2_reps, graph, ns, mp, device, theta, stp, hom, ip, tau_mult, steps=pd_steps)
                 log[f'l1_{pname}_acc'].append(l1_a)
                 log[f'l1_{pname}_disc'].append(l1_d)
-                log[f'l2_{pname}_acc'].append(l2_a)
-                log[f'l2_{pname}_disc'].append(l2_d)
-                print(f'    {pname:10s} L1={l1_a:.0f}%/{l1_d:+.1f}%  L2={l2_a:.0f}%/{l2_d:+.1f}%', flush=True)
+                log[f'l{primary_readout}_{pname}_acc'] = log.get(f'l{primary_readout}_{pname}_acc', [])
+                log[f'l{primary_readout}_{pname}_acc'].append(l3_a)
+                log[f'l{primary_readout}_{pname}_disc'] = log.get(f'l{primary_readout}_{pname}_disc', [])
+                log[f'l{primary_readout}_{pname}_disc'].append(l3_d)
+                print(f'    {pname:10s} L1={l1_a:.0f}%/{l1_d:+.1f}%  L{primary_readout}={l3_a:.0f}%/{l3_d:+.1f}%', flush=True)
 
-            # Higher-level readout (L4, L5 if they exist)
+            # All other readout levels (L2, L4, L5)
             for lv, (lv_idx, lv_topk) in readout_levels.items():
                 if lv == primary_readout:
-                    continue  # already measured above as "L2"
+                    continue
                 lv_reps = discover_l2_representations(symbols, graph, ns, mp, device, theta, stp, hom, ip,
                                                        tau_mult, lv_idx, steps=50, top_k=lv_topk)
-                # Measure hub_c (the hardest probe) at this level
                 _, _, lv_a, lv_d = measure_discrimination_dual(
                     symbols, probe_sequences['hub_c'], lv_reps, graph, ns, mp, device,
                     theta, stp, hom, ip, tau_mult, steps=pd_steps)
@@ -1074,7 +1075,7 @@ def main():
             log.setdefault('ctx_l1', []).append(ctx_l1)
             log.setdefault('ctx_l2', []).append(ctx_l2)
             log.setdefault('ctx_n', []).append(ctx_n)
-            ctx_str = f'L1={ctx_l1}/{ctx_n} L3={ctx_l2}/{ctx_n}'
+            ctx_str = f'L1={ctx_l1}/{ctx_n} L{primary_readout}={ctx_l2}/{ctx_n}'
             for tn, td in ctx_details.items():
                 ctx_str += f'  {tn}:{"Y" if td["l2_correct"] else "N"}'
             print(f'    CONTEXT  {ctx_str}', flush=True)

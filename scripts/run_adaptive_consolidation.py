@@ -639,6 +639,111 @@ def measure_echo_persistence(symbols, name, graph, ns, mp, device, theta, tau_mu
     return half_life, activity_trace
 
 
+def measure_context_probe(symbols, l2_reps, graph, ns, mp, device,
+                          theta, stp, hom, ip, tau_mult, steps=50):
+    """Test whether L2 uses sequential context to disambiguate hub symbol a30.
+
+    a30 has 3 different successors depending on context:
+      hub_a: a26 -> a30 -> a27
+      hub_b: a28 -> a30 -> a29
+      hub_c: a31 -> a30 -> a32 -> a33
+
+    For each context, we:
+      1. Present the predecessor for `steps` steps (prime context)
+      2. Present a30 for `steps` steps
+      3. Read L2 apical predictions at all 3 successor locations
+      4. Check if the correct successor gets the highest prediction
+
+    If L2 learned context: correct successor wins in each case.
+    If L2 just memorised "a30 predicts X": same winner regardless of context.
+
+    Returns: (n_correct, n_tested, details_dict)
+    """
+    hub_tests = [
+        ('hub_a', 'a26', 'a30', 'a27', ['a29', 'a32']),
+        ('hub_b', 'a28', 'a30', 'a29', ['a27', 'a32']),
+        ('hub_c', 'a31', 'a30', 'a32', ['a27', 'a29']),
+    ]
+
+    n_correct_l1 = 0
+    n_correct_l2 = 0
+    n_tested = 0
+    details = {}
+
+    for test_name, ctx_name, hub_name, correct_name, wrong_names in hub_tests:
+        # Check all symbols exist in l2_reps
+        all_names = [correct_name] + wrong_names
+        missing = [n for n in all_names if n not in l2_reps]
+        if missing or hub_name not in symbols or ctx_name not in symbols:
+            continue
+
+        ctx_pattern = symbols[ctx_name]
+        hub_pattern = symbols[hub_name]
+
+        # Step 1: Prime with context predecessor
+        for s in range(steps):
+            step = graph.step_count
+            dual_channel_send(ns, graph, mp, device)
+            inputs = mp.read_inputs(step)
+            inputs.basal[ctx_pattern.long()] += 2.0
+            error_node_update(ns, inputs, theta_mod=theta.get_modulation(step), tau_mult=tau_mult)
+            _fused.stp(ns.output)
+            if step % 100 == 0:
+                for et in PLASTIC_EDGE_TYPES:
+                    if graph.has_edge_type(et):
+                        hom.update(graph.edge_store(et), ns, 1.0)
+                ip.update(ns)
+            graph.increment_step()
+
+        # Step 2: Present hub symbol a30
+        for s in range(steps):
+            step = graph.step_count
+            dual_channel_send(ns, graph, mp, device)
+            inputs = mp.read_inputs(step)
+            inputs.basal[hub_pattern.long()] += 2.0
+            error_node_update(ns, inputs, theta_mod=theta.get_modulation(step), tau_mult=tau_mult)
+            _fused.stp(ns.output)
+            graph.increment_step()
+
+        # Step 3: Read predictions (apical activation at each successor)
+        # L1: apical at symbol's sensory nodes
+        ap_l1 = {}
+        for name in all_names:
+            ap_l1[name] = ns.apical[symbols[name].long()].mean().item()
+
+        # L2: apical at successor's L2 representation
+        ap_l2 = {}
+        for name in all_names:
+            if name in l2_reps:
+                ap_l2[name] = ns.apical[l2_reps[name].long()].mean().item()
+
+        # Step 4: Cool down (prevent bleeding between tests)
+        for s in range(20):
+            step = graph.step_count
+            dual_channel_send(ns, graph, mp, device)
+            inputs = mp.read_inputs(step)
+            error_node_update(ns, inputs, theta_mod=theta.get_modulation(step), tau_mult=tau_mult)
+            graph.increment_step()
+
+        # Score: does the correct successor get the highest prediction?
+        l1_winner = max(ap_l1, key=ap_l1.get) if ap_l1 else None
+        l2_winner = max(ap_l2, key=ap_l2.get) if ap_l2 else None
+        l1_correct = l1_winner == correct_name
+        l2_correct = l2_winner == correct_name
+        n_correct_l1 += int(l1_correct)
+        n_correct_l2 += int(l2_correct)
+        n_tested += 1
+
+        details[test_name] = {
+            'context': ctx_name, 'hub': hub_name,
+            'correct': correct_name, 'l1_winner': l1_winner, 'l2_winner': l2_winner,
+            'l1_correct': l1_correct, 'l2_correct': l2_correct,
+            'l1_scores': ap_l1, 'l2_scores': ap_l2,
+        }
+
+    return n_correct_l1, n_correct_l2, n_tested, details
+
+
 def get_stiffness_stats(graph):
     all_stiff = []
     for et in PLASTIC_EDGE_TYPES:
@@ -934,6 +1039,17 @@ def main():
                 log[f'l2_{pname}_disc'].append(l2_d)
                 print(f'    {pname:10s} L1={l1_a:.0f}%/{l1_d:+.1f}%  L2={l2_a:.0f}%/{l2_d:+.1f}%', flush=True)
 
+            # Context probe: does L2 disambiguate a30 based on predecessor?
+            ctx_l1, ctx_l2, ctx_n, ctx_details = measure_context_probe(
+                symbols, l2_reps, graph, ns, mp, device, theta, stp, hom, ip, tau_mult, steps=pd_steps)
+            log.setdefault('ctx_l1', []).append(ctx_l1)
+            log.setdefault('ctx_l2', []).append(ctx_l2)
+            log.setdefault('ctx_n', []).append(ctx_n)
+            ctx_str = f'L1={ctx_l1}/{ctx_n} L2={ctx_l2}/{ctx_n}'
+            for tn, td in ctx_details.items():
+                ctx_str += f'  {tn}:{"Y" if td["l2_correct"] else "N"}'
+            print(f'    CONTEXT  {ctx_str}', flush=True)
+
             hl, _ = measure_echo_persistence(symbols, 'a01', graph, ns, mp, device, theta, tau_mult, steps=pd_steps)
             mean_s, p10, p50, p90 = get_stiffness_stats(graph)
             log['echo_hl'].append(hl)
@@ -1043,16 +1159,22 @@ def main():
         transfer = l2_f - baseline
         print(f'    {nkey:16s} L2: {baseline:+.1f}% -> {l2_f:+.1f}% (transfer {transfer:+.1f}%)', flush=True)
 
+    # Context probe: the key test of abstraction
+    if log.get('ctx_l2'):
+        print(f'\n  Context disambiguation (hub a30):', flush=True)
+        print(f'    L1: {log["ctx_l1"][0]}/3 -> {log["ctx_l1"][-1]}/3', flush=True)
+        print(f'    L2: {log["ctx_l2"][0]}/3 -> {log["ctx_l2"][-1]}/3', flush=True)
+        if log['ctx_l2'][-1] >= 2:
+            print(f'    ** L2 disambiguates hub based on context — ABSTRACTION **', flush=True)
+        else:
+            print(f'    L2 does not yet disambiguate — more training or curriculum needed', flush=True)
+
     if log['echo_hl']:
         print(f'\n  Echo: {log["echo_hl"][0]} -> {log["echo_hl"][-1]} steps', flush=True)
     if log['stiff_p50']:
         print(f'  Stiffness p50: {log["stiff_p50"][0]:.4f} -> {log["stiff_p50"][-1]:.4f} (target={TARGET_STIFFNESS})', flush=True)
     if log['decay_rate']:
         print(f'  Decay: {log["decay_rate"][0]:.6f} -> {log["decay_rate"][-1]:.6f}', flush=True)
-    print(f'\n  KEY: Does p50 converge to ~{TARGET_STIFFNESS}?', flush=True)
-    print(f'  KEY: Does decay rate stabilize (not railing at min/max)?', flush=True)
-    print(f'  KEY: Does transfer improve vs v3 (which was inert)?', flush=True)
-    print(f'  Compare: v2 transfer was -12.1%, v3 TBD, run_definitive_test was +5.4%', flush=True)
 
     torch.save(log, 'adaptive_consolidation_results.pt')
     print(f'\nFinished: {time.strftime("%Y-%m-%d %H:%M:%S")}', flush=True)

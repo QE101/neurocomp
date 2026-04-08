@@ -994,6 +994,7 @@ def main():
 
         # Sleep
         if (epoch + 1) % SLEEP_EVERY == 0 and hipp.n_stored() > 0:
+            torch.cuda.synchronize()  # flush compiled kernel state before sleep
             schedule = hipp.replay_schedule(config.hippocampal.replay_interleave)
             for pidx in schedule:
                 replay = hipp.get_replay_pattern(pidx)

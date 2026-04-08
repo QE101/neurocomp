@@ -110,13 +110,15 @@ class FusedPlasticity:
     fields with views, giving zero-copy access from message passing.
     """
 
-    def __init__(self, graph: NeuromorphicGraph, stp_cfg: STPConfig, delay_buffer=None):
+    def __init__(self, graph: NeuromorphicGraph, stp_cfg: STPConfig, delay_buffer=None,
+                 fp16_stp: bool = True):
         self.stp_cfg = stp_cfg
         self.device = graph.device
         self.U = stp_cfg.U_baseline
         self.tau_f = stp_cfg.tau_facilitation
         self.tau_d = stp_cfg.tau_depression
         self._compiled = False
+        self._fp16_stp = fp16_stp
         self._build(graph)
 
     def _build(self, graph: NeuromorphicGraph):
@@ -140,9 +142,10 @@ class FusedPlasticity:
         if self.n_total == 0:
             return
 
-        self.f_facilitation = torch.zeros(self.n_total, device=device)
-        self.f_depression = torch.ones(self.n_total, device=device)
-        self.f_release_prob = torch.zeros(self.n_total, device=device)
+        stp_dtype = torch.float16 if self._fp16_stp else torch.float32
+        self.f_facilitation = torch.zeros(self.n_total, device=device, dtype=stp_dtype)
+        self.f_depression = torch.ones(self.n_total, device=device, dtype=stp_dtype)
+        self.f_release_prob = torch.zeros(self.n_total, device=device, dtype=stp_dtype)
         self.f_weight = torch.zeros(self.n_total, device=device)
         self.f_pre_trace = torch.zeros(self.n_total, device=device)
         self.f_post_trace = torch.zeros(self.n_total, device=device)
@@ -204,7 +207,8 @@ class FusedPlasticity:
             self._learn_fn = torch.compile(_learn_core, mode='default')
             # Warmup both (triggers JIT compilation)
             if self.n_total > 0:
-                pre_act = torch.zeros(self.n_total, device=self.device)
+                stp_dtype = torch.float16 if self._fp16_stp else torch.float32
+                pre_act = torch.zeros(self.n_total, device=self.device, dtype=stp_dtype)
                 self._stp_fn(self.f_facilitation, self.f_depression, self.f_release_prob,
                              pre_act, self.U, self.tau_f, self.tau_d)
                 # Learn warmup with matching shapes
@@ -228,6 +232,8 @@ class FusedPlasticity:
             return
 
         pre_activity = output[self.f_src64]
+        if self._fp16_stp and pre_activity.dtype != torch.float16:
+            pre_activity = pre_activity.half()
 
         if self._compiled:
             self._stp_fn(self.f_facilitation, self.f_depression, self.f_release_prob,

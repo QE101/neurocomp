@@ -396,22 +396,74 @@ def build_sensory_symbols(input_region, device):
     n_input = input_region.shape[0]
     n_on = max(10, int(n_input * SYMBOL_SPARSITY))
     torch.manual_seed(777)
+
+    # ================================================================
+    # RICH CURRICULUM: 14 training sequences, 48 unique symbols
+    # Forces L2 to learn abstract sequential structure:
+    #   - Shared bigrams: a02->a03, a06->a07 appear in 3 sequences each
+    #   - Hub symbol: a30 has 3 different successors (context-dependent)
+    #   - Internal repetition: same symbol at multiple positions
+    #   - Chunk reuse: [a42,a43] appears as a unit in 2 sequences
+    #   - Varied lengths: 3-7 items
+    #
+    # Step budget at pd_steps=100: 67*100 + 14*20 = 6980 steps/epoch
+    # Step budget at pd_steps=30:  67*30  + 14*20 = 2290 steps/epoch
+    # ================================================================
+
     sequences = {
-        'short': ['S1', 'S2', 'S3'],
-        'digits': ['D1', 'D2', 'D3', 'D4', 'D5'],
-        'days': ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+        # Simple chains (baselines, varied length)
+        'chain3':   ['a01', 'a02', 'a03'],
+        'chain5':   ['a04', 'a05', 'a06', 'a07', 'a08'],
+        'chain7':   ['a09', 'a10', 'a11', 'a12', 'a13', 'a14', 'a15'],
+
+        # Shared bigrams: a02->a03 and a06->a07 in multiple contexts
+        'share_a':  ['a16', 'a02', 'a03', 'a17'],
+        'share_b':  ['a18', 'a19', 'a02', 'a03', 'a20'],
+        'share_c':  ['a06', 'a07', 'a21', 'a22'],
+        'share_d':  ['a23', 'a06', 'a07', 'a24', 'a25'],
+
+        # Hub symbol: a30 with 3 different successors
+        'hub_a':    ['a26', 'a30', 'a27'],
+        'hub_b':    ['a28', 'a30', 'a29'],
+        'hub_c':    ['a31', 'a30', 'a32', 'a33'],
+
+        # Internal repetition
+        'repeat_a': ['a34', 'a35', 'a36', 'a34', 'a37'],
+        'repeat_b': ['a38', 'a39', 'a38', 'a40', 'a41', 'a38'],
+
+        # Chunk reuse: [a42, a43] as a transferable unit
+        'chunk_a':  ['a42', 'a43', 'a44', 'a45'],
+        'chunk_b':  ['a46', 'a42', 'a43', 'a47', 'a48'],
     }
-    novel_seq = ['N1', 'N2', 'N3', 'N4', 'N5']
-    all_names = []
+
+    # 5 types of transfer test — each probes a different abstraction
+    novel_sequences = {
+        'novel_pure':    ['n01', 'n02', 'n03', 'n04', 'n05'],   # all novel
+        'novel_reorder': ['a03', 'a07', 'a30', 'a35', 'a43'],   # familiar, new order
+        'novel_bigram':  ['n06', 'a02', 'a03', 'n07'],           # familiar bigram + novel flanks
+        'novel_chunk':   ['n08', 'n09', 'a42', 'a43', 'n10'],    # familiar chunk + novel context
+        'novel_hub':     ['n11', 'a30', 'n12', 'n13'],           # hub in novel context
+    }
+
+    all_names = set()
     for seq in sequences.values():
-        all_names.extend(seq)
-    all_names.extend(novel_seq)
+        all_names.update(seq)
+    for seq in novel_sequences.values():
+        all_names.update(seq)
+    all_names = sorted(all_names)
+
     symbols = {}
     for name in all_names:
         perm = torch.randperm(n_input, device=device)
         symbols[name] = input_region[perm[:n_on]]
+
+    n_train = len([n for n in all_names if n.startswith('a')])
+    n_novel = len([n for n in all_names if n.startswith('n')])
+    n_items = sum(len(s) for s in sequences.values())
     print(f'  Sensory surface: {n_input} nodes, {n_on} ON per symbol', flush=True)
-    return symbols, sequences, novel_seq, n_on
+    print(f'  Training: {len(sequences)} sequences, {n_items} items/epoch, {n_train} unique symbols', flush=True)
+    print(f'  Transfer: {len(novel_sequences)} sequences, {n_novel} novel symbols', flush=True)
+    return symbols, sequences, novel_sequences, n_on
 
 
 # ================================================================
@@ -694,20 +746,31 @@ def main():
     exc_idx = torch.where(_exc_mask)[0]
     exc_z = ns.position[exc_idx, 2]
     input_region = exc_idx[exc_z <= exc_z.quantile(INPUT_FRACTION)]
-    symbols, sequences, novel_seq, n_on = build_sensory_symbols(input_region, device)
+    symbols, sequences, novel_sequences, n_on = build_sensory_symbols(input_region, device)
     all_symbol_nodes = input_region
 
     hipp = HippocampalSystem(config=config.hippocampal, cortical_input_indices=all_symbol_nodes,
                               n_cortical=N, device=device, seed=config.simulation.seed)
 
     # Check for resume
+    # Probe sequences for periodic measurement (one from each category)
+    probe_sequences = {
+        'chain7':   sequences['chain7'],
+        'share_b':  sequences['share_b'],
+        'hub_c':    sequences['hub_c'],
+        'repeat_a': sequences['repeat_a'],
+        'chunk_b':  sequences['chunk_b'],
+    }
+
     latest_ckpt = None
     start_epoch = 0
-    log = {'epoch': [],
-           'l1_days_acc': [], 'l1_days_disc': [], 'l2_days_acc': [], 'l2_days_disc': [],
-           'l1_digits_acc': [], 'l1_digits_disc': [], 'l2_digits_acc': [], 'l2_digits_disc': [],
-           'echo_hl': [], 'avg_stiffness': [], 'stiff_p10': [], 'stiff_p50': [], 'stiff_p90': [],
-           'decay_rate': [], 'n_edges': []}
+    log = {'epoch': []}
+    for pname in probe_sequences:
+        for prefix in ['l1', 'l2']:
+            log[f'{prefix}_{pname}_acc'] = []
+            log[f'{prefix}_{pname}_disc'] = []
+    log.update({'echo_hl': [], 'avg_stiffness': [], 'stiff_p10': [],
+                'stiff_p50': [], 'stiff_p90': [], 'decay_rate': [], 'n_edges': []})
     for f in sorted(CHECKPOINT_DIR.glob('epoch_*.pt')):
         latest_ckpt = f
 
@@ -738,29 +801,10 @@ def main():
         _basal_tau = torch.tensor(10.0, device=device)
         _apical_tau = torch.tensor(20.0, device=device)
         _input_norm = torch.tensor(1.0, device=device)
-    if sys.platform != 'win32':
-        try:
-            _compiled_node = torch.compile(_node_core, mode='default')
-            # Warmup
-            _noise = torch.randn(N, device=device) * 0.005
-            _compiled_node(
-                ns.basal.clone(), ns.apical.clone(), ns.output.clone(),
-                ns.prediction_error.clone(), ns.gain, ns.activity_ema.clone(),
-                torch.zeros(N, device=device), torch.zeros(N, device=device),
-                torch.zeros(N, device=device), torch.zeros(N, device=device),
-                torch.zeros(N, device=device), torch.zeros(N, device=device),
-                _exc_mask, _exc_f, _inh_mask, _inh_f, _sst_mask, _pv_f,
-                _basal_tau, _apical_tau, _input_norm, 1.0, _noise)
-            torch.cuda.synchronize()
-            print('  [compile] node update compiled', flush=True)
-        except Exception as e:
-            print(f'  [compile] node update failed: {e}', flush=True)
-            _compiled_node = None
-    else:
-        _compiled_node = None
+    # Node compile disabled — returns new tensors that conflict with CUDA internals
+    # after long runs. STP+learn compile is where the real speedup lives anyway.
+    _compiled_node = None
 
-    day_names = sequences['days']
-    digit_names = sequences['digits']
     seq_keys = list(sequences.keys())
     t0 = time.perf_counter()
 
@@ -778,12 +822,12 @@ def main():
 
     if start_epoch == 0:
         print(f'\n--- BASELINE ---', flush=True)
-        l1_da, l1_dd, l2_da, l2_dd = measure_discrimination_dual(
-            symbols, day_names, l2_reps, graph, ns, mp, device, theta, stp, hom, ip, tau_mult)
-        hl, _ = measure_echo_persistence(symbols, 'Mon', graph, ns, mp, device, theta, tau_mult)
+        for pname, pseq in probe_sequences.items():
+            l1_a, l1_d, l2_a, l2_d = measure_discrimination_dual(
+                symbols, pseq, l2_reps, graph, ns, mp, device, theta, stp, hom, ip, tau_mult)
+            print(f'  {pname}: L1={l1_a:.0f}%/{l1_d:+.1f}%  L2={l2_a:.0f}%/{l2_d:+.1f}%', flush=True)
+        hl, _ = measure_echo_persistence(symbols, 'a01', graph, ns, mp, device, theta, tau_mult)
         mean_s, p10, p50, p90 = get_stiffness_stats(graph)
-        print(f'  Days L1: acc={l1_da:.0f}% disc={l1_dd:+.1f}%', flush=True)
-        print(f'  Days L2: acc={l2_da:.0f}% disc={l2_dd:+.1f}%', flush=True)
         print(f'  Echo half-life: {hl} steps', flush=True)
         print(f'  Stiffness: mean={mean_s:.4f} p10={p10:.4f} p50={p50:.4f} p90={p90:.4f}', flush=True)
         print(f'  Decay rate: {_current_decay:.6f}', flush=True)
@@ -874,19 +918,20 @@ def main():
             l2_reps = discover_l2_representations(symbols, graph, ns, mp, device, theta, stp, hom, ip,
                                                     tau_mult, l2_exc_idx, steps=50, top_k=200)
 
-            l1_da, l1_dd, l2_da, l2_dd = measure_discrimination_dual(
-                symbols, day_names, l2_reps, graph, ns, mp, device, theta, stp, hom, ip, tau_mult, steps=pd_steps)
-            l1_dia, l1_did, l2_dia, l2_did = measure_discrimination_dual(
-                symbols, digit_names, l2_reps, graph, ns, mp, device, theta, stp, hom, ip, tau_mult, steps=pd_steps)
-            hl, _ = measure_echo_persistence(symbols, 'Mon', graph, ns, mp, device, theta, tau_mult, steps=pd_steps)
-
-            mean_s, p10, p50, p90 = get_stiffness_stats(graph)
-
             log['epoch'].append(epoch + 1)
-            log['l1_days_acc'].append(l1_da); log['l1_days_disc'].append(l1_dd)
-            log['l2_days_acc'].append(l2_da); log['l2_days_disc'].append(l2_dd)
-            log['l1_digits_acc'].append(l1_dia); log['l1_digits_disc'].append(l1_did)
-            log['l2_digits_acc'].append(l2_dia); log['l2_digits_disc'].append(l2_did)
+            print(f'  Ep {epoch+1:5d} ({pd_steps}st):', flush=True)
+
+            for pname, pseq in probe_sequences.items():
+                l1_a, l1_d, l2_a, l2_d = measure_discrimination_dual(
+                    symbols, pseq, l2_reps, graph, ns, mp, device, theta, stp, hom, ip, tau_mult, steps=pd_steps)
+                log[f'l1_{pname}_acc'].append(l1_a)
+                log[f'l1_{pname}_disc'].append(l1_d)
+                log[f'l2_{pname}_acc'].append(l2_a)
+                log[f'l2_{pname}_disc'].append(l2_d)
+                print(f'    {pname:10s} L1={l1_a:.0f}%/{l1_d:+.1f}%  L2={l2_a:.0f}%/{l2_d:+.1f}%', flush=True)
+
+            hl, _ = measure_echo_persistence(symbols, 'a01', graph, ns, mp, device, theta, tau_mult, steps=pd_steps)
+            mean_s, p10, p50, p90 = get_stiffness_stats(graph)
             log['echo_hl'].append(hl)
             log['avg_stiffness'].append(mean_s)
             log['stiff_p10'].append(p10)
@@ -895,10 +940,7 @@ def main():
             log['decay_rate'].append(_current_decay)
             log['n_edges'].append(graph.n_edges())
 
-            print(f'  Ep {epoch+1:5d} ({pd_steps}st):', flush=True)
-            print(f'    Days  L1={l1_da:.0f}%/{l1_dd:+.1f}%  L2={l2_da:.0f}%/{l2_dd:+.1f}%', flush=True)
-            print(f'    Digit L1={l1_dia:.0f}%/{l1_did:+.1f}%  L2={l2_dia:.0f}%/{l2_did:+.1f}%', flush=True)
-            print(f'    echo={hl}st stiff={mean_s:.4f} [p10={p10:.4f} p50={p50:.4f} p90={p90:.4f}] decay={_current_decay:.6f} edges={graph.n_edges():,} ({elapsed:.0f}s)', flush=True)
+            print(f'    echo={hl}st stiff=[{p10:.3f}/{p50:.3f}/{p90:.3f}] decay={_current_decay:.6f} edges={graph.n_edges():,} ({elapsed:.0f}s)', flush=True)
 
         # Checkpoint
         if (epoch + 1) % CHECKPOINT_EVERY == 0:
@@ -912,84 +954,95 @@ def main():
     # TRANSFER TEST
     # ================================================================
     print(f'\n--- TRANSFER TEST ---', flush=True)
-    print('  (Does adaptive consolidation allow novel sequences to break through?)', flush=True)
+    print(f'  5 transfer types: pure novel, reorder, bigram, chunk, hub', flush=True)
 
+    # Discover L2 reps for all novel-sequence symbols
+    novel_symbol_set = {}
+    for nseq in novel_sequences.values():
+        for name in nseq:
+            novel_symbol_set[name] = symbols[name]
     l2_reps_novel = discover_l2_representations(
-        {n: symbols[n] for n in novel_seq}, graph, ns, mp, device,
+        novel_symbol_set, graph, ns, mp, device,
         theta, stp, hom, ip, tau_mult, l2_exc_idx, steps=100, top_k=200)
     l2_reps.update(l2_reps_novel)
 
-    _, _, l2_novel_before_acc, l2_novel_before_disc = measure_discrimination_dual(
-        symbols, novel_seq, l2_reps, graph, ns, mp, device, theta, stp, hom, ip, tau_mult)
-    print(f'  Before: L2 acc={l2_novel_before_acc:.0f}% disc={l2_novel_before_disc:+.1f}%', flush=True)
+    # Baseline per transfer type
+    novel_baselines = {}
+    for nkey, nseq in novel_sequences.items():
+        _, _, l2_acc, l2_disc = measure_discrimination_dual(
+            symbols, nseq, l2_reps, graph, ns, mp, device, theta, stp, hom, ip, tau_mult)
+        novel_baselines[nkey] = l2_disc
+        print(f'  {nkey:16s} before: L2={l2_disc:+.1f}%', flush=True)
 
+    # Train all novel sequences
     for ep in range(200):
-        for name in novel_seq:
-            pattern = symbols[name]
-            for s in range(50):
-                step = graph.step_count
-                dual_channel_send(ns, graph, mp, device)
-                inputs = mp.read_inputs(step)
-                inputs.basal[pattern.long()] += get_strength()
-                error_node_update(ns, inputs, theta_mod=theta.get_modulation(step), tau_mult=tau_mult)
-                _fused.stp(ns.output)
-                _fused.learn(ns, _exc_mask, _current_decay, is_replay=False)
-                graph.increment_step()
+        novel_order = list(novel_sequences.keys())
+        np.random.shuffle(novel_order)
+        for nkey in novel_order:
+            nseq = novel_sequences[nkey]
+            for name in nseq:
+                pattern = symbols[name]
+                for s in range(50):
+                    step = graph.step_count
+                    dual_channel_send(ns, graph, mp, device)
+                    inputs = mp.read_inputs(step)
+                    inputs.basal[pattern.long()] += get_strength()
+                    error_node_update(ns, inputs, theta_mod=theta.get_modulation(step), tau_mult=tau_mult)
+                    _fused.stp(ns.output)
+                    _fused.learn(ns, _exc_mask, _current_decay, is_replay=False)
+                    graph.increment_step()
 
-        # Adapt during transfer too
         adapt_decay_rate(graph)
 
         if (ep + 1) % 50 == 0:
             l2_reps_novel = discover_l2_representations(
-                {n: symbols[n] for n in novel_seq}, graph, ns, mp, device,
+                novel_symbol_set, graph, ns, mp, device,
                 theta, stp, hom, ip, tau_mult, l2_exc_idx, steps=50, top_k=200)
             l2_reps.update(l2_reps_novel)
+            print(f'  Transfer ep{ep+1}:', flush=True)
+            for nkey, nseq in novel_sequences.items():
+                _, l1_d, _, l2_d = measure_discrimination_dual(
+                    symbols, nseq, l2_reps, graph, ns, mp, device, theta, stp, hom, ip, tau_mult)
+                print(f'    {nkey:16s} L1={l1_d:+.1f}% L2={l2_d:+.1f}%', flush=True)
 
-            _, l1_nd, _, l2_nd = measure_discrimination_dual(
-                symbols, novel_seq, l2_reps, graph, ns, mp, device, theta, stp, hom, ip, tau_mult)
-            mean_s, p10, p50, p90 = get_stiffness_stats(graph)
-            print(f'  Novel ep{ep+1}: L1={l1_nd:+.1f}% L2={l2_nd:+.1f}% stiff={mean_s:.4f} [{p10:.4f}/{p50:.4f}/{p90:.4f}] decay={_current_decay:.6f}', flush=True)
-
-    # Final novel measurement
+    # Final measurement
     l2_reps_novel = discover_l2_representations(
-        {n: symbols[n] for n in novel_seq}, graph, ns, mp, device,
+        novel_symbol_set, graph, ns, mp, device,
         theta, stp, hom, ip, tau_mult, l2_exc_idx, steps=100, top_k=200)
     l2_reps.update(l2_reps_novel)
 
-    _, l1_final, _, l2_final = measure_discrimination_dual(
-        symbols, novel_seq, l2_reps, graph, ns, mp, device, theta, stp, hom, ip, tau_mult)
-    l2_transfer = l2_final - l2_novel_before_disc
-
-    # Results
+    # Results summary
     print(f'\n{"="*60}', flush=True)
-    print(f'  RESULTS: Adaptive Consolidation v4', flush=True)
+    print(f'  RESULTS: Rich Curriculum + Adaptive Consolidation', flush=True)
+    print(f'  {len(sequences)} sequences, {sum(len(s) for s in sequences.values())} items/epoch', flush=True)
     print(f'  Target stiffness={TARGET_STIFFNESS}, final decay={_current_decay:.6f}', flush=True)
     print(f'{"="*60}', flush=True)
 
-    for key_name, l2_key in [('Days', 'days'), ('Digits', 'digits')]:
-        if log[f'l1_{l2_key}_acc']:
-            print(f'  {key_name}:', flush=True)
-            print(f'    L1: final={log[f"l1_{l2_key}_acc"][-1]:.0f}%/{log[f"l1_{l2_key}_disc"][-1]:+.1f}% '
-                  f'peak={max(log[f"l1_{l2_key}_disc"]):+.1f}%', flush=True)
-            print(f'    L2: final={log[f"l2_{l2_key}_acc"][-1]:.0f}%/{log[f"l2_{l2_key}_disc"][-1]:+.1f}% '
-                  f'peak={max(log[f"l2_{l2_key}_disc"]):+.1f}%', flush=True)
+    # Training probe results
+    print(f'\n  Training probes:', flush=True)
+    for pname in probe_sequences:
+        if log[f'l1_{pname}_disc']:
+            l1_peak = max(log[f'l1_{pname}_disc'])
+            l2_peak = max(log[f'l2_{pname}_disc'])
+            l1_final = log[f'l1_{pname}_disc'][-1]
+            l2_final = log[f'l2_{pname}_disc'][-1]
+            print(f'    {pname:10s} L1: {l1_final:+.1f}% (peak {l1_peak:+.1f}%)  L2: {l2_final:+.1f}% (peak {l2_peak:+.1f}%)', flush=True)
+
+    # Transfer results
+    print(f'\n  Transfer (200 epochs):', flush=True)
+    for nkey, nseq in novel_sequences.items():
+        _, l1_f, _, l2_f = measure_discrimination_dual(
+            symbols, nseq, l2_reps, graph, ns, mp, device, theta, stp, hom, ip, tau_mult)
+        baseline = novel_baselines[nkey]
+        transfer = l2_f - baseline
+        print(f'    {nkey:16s} L2: {baseline:+.1f}% -> {l2_f:+.1f}% (transfer {transfer:+.1f}%)', flush=True)
 
     if log['echo_hl']:
-        print(f'  Echo half-life: {log["echo_hl"][0]} -> {log["echo_hl"][-1]} steps', flush=True)
-    if log['avg_stiffness']:
-        print(f'  Stiffness trajectory:', flush=True)
-        print(f'    mean: {log["avg_stiffness"][0]:.4f} -> {log["avg_stiffness"][-1]:.4f}', flush=True)
-        print(f'    p50:  {log["stiff_p50"][0]:.4f} -> {log["stiff_p50"][-1]:.4f} (target={TARGET_STIFFNESS})', flush=True)
-        print(f'    p90:  {log["stiff_p90"][0]:.4f} -> {log["stiff_p90"][-1]:.4f}', flush=True)
-        if len(log['avg_stiffness']) >= 5:
-            last5 = log['stiff_p50'][-5:]
-            stiff_range = max(last5) - min(last5)
-            print(f'    p50 last-5 range: {stiff_range:.4f} (< 0.05 = stable)', flush=True)
+        print(f'\n  Echo: {log["echo_hl"][0]} -> {log["echo_hl"][-1]} steps', flush=True)
+    if log['stiff_p50']:
+        print(f'  Stiffness p50: {log["stiff_p50"][0]:.4f} -> {log["stiff_p50"][-1]:.4f} (target={TARGET_STIFFNESS})', flush=True)
     if log['decay_rate']:
-        print(f'  Decay rate: {log["decay_rate"][0]:.6f} -> {log["decay_rate"][-1]:.6f} (range [{DECAY_MIN}, {DECAY_MAX}])', flush=True)
-
-    print(f'\n  Transfer (L1): {l1_final:+.1f}%', flush=True)
-    print(f'  Transfer (L2): {l2_novel_before_disc:+.1f}% -> {l2_final:+.1f}% ({l2_transfer:+.1f}%)', flush=True)
+        print(f'  Decay: {log["decay_rate"][0]:.6f} -> {log["decay_rate"][-1]:.6f}', flush=True)
     print(f'\n  KEY: Does p50 converge to ~{TARGET_STIFFNESS}?', flush=True)
     print(f'  KEY: Does decay rate stabilize (not railing at min/max)?', flush=True)
     print(f'  KEY: Does transfer improve vs v3 (which was inert)?', flush=True)

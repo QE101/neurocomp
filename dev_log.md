@@ -3047,9 +3047,97 @@ Not needed yet, but will be needed when curriculum requires N=500K+ with 50+ seq
 - `checkpoints/adaptive_consolidation/` — v4 checkpoints (epoch 1000)
 - `adaptive_consolidation_results.pt` — full log with stiffness/decay trajectories
 
+## Session 10 — 2026-04-07: Engine Optimization (4.2x speedup)
+
+### Summary
+
+Systematic profiling → targeted optimization of the training step. No changes to graph dynamics — purely execution speed. 9.68 ms/step → 2.29 ms/step (4.2x). Experiments drop from 16 min to 3.8 min.
+
+### Profiling Discovery
+
+Initial profiling revealed message passing was only 17% of step time — the wrong target. The real costs:
+
+| Component | Time | % of step |
+|-----------|------|-----------|
+| Learning (6 per-type loops) | 4.14 ms | 39% |
+| STP (6 per-type loops) | 2.67 ms | 25% |
+| Inhibitory node update (3-type loop) | 1.08 ms | 10% |
+| Message passing | 1.81 ms | 17% |
+
+### Optimizations Applied
+
+**1. Fused Plasticity (1.9x)** — `graph_brain/engine/fused_plasticity.py`
+- Concatenated all 6 edge types into flat buffers (4.7M edges)
+- ONE vectorized STP pass instead of 6 separate loops
+- ONE vectorized learning pass instead of 6 separate loops
+- EdgeStore fields replaced with views into fused buffer (zero-copy)
+- Reduced kernel launches from ~150 to ~25 per step
+- Result: 9.68 → 5.02 ms
+
+**2. Vectorized Inhibitory Update (2.67x on that component)**
+- Eliminated Python loop over PV/SST/VIP (non-overlapping masks)
+- Single pass: all 3 inhibitory types updated at once
+- Removed per-step `torch.zeros_like` allocation
+
+**3. torch.compile (additional 1.87x)** — requires WSL
+- Compiled STP core, learning core, and node update via `torch.compile(mode='default')`
+- Fuses elementwise chains into single Triton kernels
+- Intermediates stay in registers instead of global memory round-trips
+- Compilation: 8s one-time cost, cached thereafter
+- Result: 5.02 → 2.68 ms
+
+**4. FP16 STP (additional 1.17x)**
+- STP state (facilitation, depression, release_prob) stored as float16
+- Halves memory traffic for STP operations
+- Drift after 100 steps: fac=0.007, dep=0.019 (within STP noise floor)
+- Learning stays FP32 (weight updates ~1e-6 need precision)
+- Result: 2.68 → 2.29 ms
+
+### Failed Experiments
+
+| Approach | Result | Why |
+|----------|--------|-----|
+| SpMV (cuSPARSE) | 0.52x | CSR overhead > savings at N=50K |
+| Active gating | 0.50x | nonzero() + indexing > scatter savings |
+| Batched scatter | 1.02x | Memory bandwidth bottleneck, not launches |
+| CUDA Graphs | 1.31x | Same kernels, only removes dispatch overhead |
+| Pre-allocated temps | 1.0x | PyTorch expression fusion already optimal |
+| Fused send (single index_add_) | 0.73x | Worse cache locality on 4.7M scattered writes |
+| FP16 message passing | 0.95x | Scatter is bottleneck, not data size |
+| FP16 learning | 0.96x | Cast overhead > bandwidth savings |
+| FP16 node update | 0.65x | softplus casts kill performance |
+
+### Key Insights
+
+- At N=50K the GPU is **memory-bandwidth-bound**, not compute-bound (1 FLOP/byte vs 76 needed for compute-bound)
+- GPU fans spin from sustained thermal load, not computational intensity
+- Random-access gathers/scatters (graph topology) run at ~25% of peak bandwidth
+- torch.compile's value is reducing memory traffic (register fusion), not compute
+- FP16 only helps where data volume dominates (STP), not where compute dominates (learning expressions)
+- Python overhead is negligible after torch.compile — the "bloat" is in memory access patterns
+
+### Final Performance
+
+| Version | ms/step | steps/sec | Experiment | Speedup |
+|---------|---------|-----------|------------|---------|
+| Original | 9.68 | 103 | 16.2 min | 1.0x |
+| Fused (Windows) | 5.02 | 199 | 8.4 min | 1.9x |
+| + compiled (WSL) | 2.68 | 374 | 4.5 min | 3.6x |
+| + FP16 STP | 2.29 | 437 | 3.8 min | 4.2x |
+
+### Files
+
+- `graph_brain/engine/fused_plasticity.py` — FusedPlasticity class (fused STP+learn, views, FP16, compile)
+- `scripts/profile_step.py` — original step profiler
+- `scripts/profile_step_v2.py` — post-fusion profiler
+- `scripts/bench_fused.py` — fused vs original correctness + speed
+- `scripts/bench_compile.py` — torch.compile benchmark
+- `scripts/bench_fp16.py` — FP16 mixed precision benchmark
+- `scripts/profile_step_fused.py` — end-to-end old vs fused
+
 ### What's Next
 
 1. **Curriculum design**: many diverse sequences to enable L2 abstraction
-2. **Engine rewrite**: block-sparse Flash Attention for 10-100x speedup
-3. **3-4 level hierarchy**: deeper abstraction with matched time constants
-4. **RL credit assignment**: long-horizon reward for eventual trading application
+2. **3-4 level hierarchy**: deeper abstraction with matched time constants
+3. **RL credit assignment**: long-horizon reward for eventual trading application
+4. **N=500K scaling**: when curriculum demands it, the engine optimizations scale up further

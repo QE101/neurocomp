@@ -473,7 +473,7 @@ def build_sensory_symbols(input_region, device):
 # LEVEL 2 READOUT
 # ================================================================
 def discover_l2_representations(symbols, graph, ns, mp, device, theta, stp, hom, ip,
-                                 tau_mult, l2_exc_idx, steps=100, top_k=l2_top_k):
+                                 tau_mult, l2_exc_idx, steps=100, top_k=200):
     l2_reps = {}
     for name, pattern in symbols.items():
         for s in range(steps):

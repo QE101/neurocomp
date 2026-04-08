@@ -170,6 +170,7 @@ class HierarchyConfig(BaseModel):
     enabled: bool = False
     n_levels: int = Field(default=2, ge=2, le=5)
     split_axis: int = Field(default=2, ge=0, le=2, description="Spatial axis for level split (0=x, 1=y, 2=z)")
+    level_split: list[float] = Field(default=None, description="Custom fraction per level (e.g. [0.6, 0.25, 0.10, 0.03, 0.02]). Must sum to 1.0. If None, equal split.")
     error_ratio: float = Field(default=0.4, gt=0.0, lt=1.0, description="Legacy: unused with universal error model")
     # Time-constant scaling (KEY for hierarchy)
     time_scale_factor: float = Field(default=3.0, gt=1.0, description="Tau multiplier per level. Level L has tau * factor^(L-1)")

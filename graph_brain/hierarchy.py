@@ -50,9 +50,13 @@ class HierarchyBuilder:
         exc_idx = torch.where(exc_mask)[0]
         exc_pos = ns.position[exc_idx, axis]
 
-        # Compute quantile boundaries
-        quantiles = torch.linspace(0, 1, n_levels + 1, device=device)[1:-1]
-        boundaries = torch.quantile(exc_pos.float(), quantiles)
+        # Compute quantile boundaries (custom split or equal)
+        if self.h_cfg.level_split is not None:
+            cumulative = torch.tensor(self.h_cfg.level_split, device=device).cumsum(0)[:-1]
+            boundaries = torch.quantile(exc_pos.float(), cumulative)
+        else:
+            quantiles = torch.linspace(0, 1, n_levels + 1, device=device)[1:-1]
+            boundaries = torch.quantile(exc_pos.float(), quantiles)
 
         # Assign excitatory nodes to levels
         counts = {}

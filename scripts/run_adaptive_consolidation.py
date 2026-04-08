@@ -47,7 +47,7 @@ BASELINE = math.log(2)
 N_EPOCHS = 1000
 MEASURE_EVERY = 50
 CHECKPOINT_EVERY = 50
-SLEEP_EVERY = 20
+SLEEP_EVERY = 5  # more frequent sleep — consolidation needs it for 5-level hierarchy
 INPUT_FRACTION = 0.20
 SYMBOL_SPARSITY = 0.10
 PAUSE = 20
@@ -158,8 +158,9 @@ CONFIG_50K = {
     },
     'simulation': {'device': 'cuda', 'seed': 42, 'record_interval': 100},
     'hierarchy': {
-        'enabled': True, 'n_levels': 2, 'split_axis': 2,
-        'time_scale_factor': 3.0, 'inter_level_k': 5,
+        'enabled': True, 'n_levels': 5, 'split_axis': 2,
+        'level_split': [0.60, 0.25, 0.10, 0.03, 0.02],  # pyramidal: 24K/10K/4K/1.2K/800 exc
+        'time_scale_factor': 2.0, 'inter_level_k': 5,    # 2.0x per level (L5 = 16x slower)
         'inter_level_sigma': 0.5, 'inter_level_init_weight': 0.02,
     },
     'hippocampal': {
@@ -835,10 +836,16 @@ def main():
     print(f'  Total: {graph.n_edges():,} edges (+{n_sw:,} SW, +{n_recurrent:,} recurrent)', flush=True)
     print(builder.summary(graph), flush=True)
 
+    # Use L3 as the abstraction readout level (4K nodes — enough for per-symbol reps)
+    # L4 (1.2K) and L5 (800) are too sparse for top_k=200 readout
+    READOUT_LEVEL = min(3, config.hierarchy.n_levels)
     l2_exc_idx = torch.where(
-        ns.type_mask(NodeType.EXCITATORY) & (ns.hierarchy_level == 2)
+        ns.type_mask(NodeType.EXCITATORY) & (ns.hierarchy_level == READOUT_LEVEL)
     )[0]
-    print(f'  Level 2 excitatory nodes: {l2_exc_idx.shape[0]:,}', flush=True)
+    print(f'  Readout level {READOUT_LEVEL}: {l2_exc_idx.shape[0]:,} excitatory nodes', flush=True)
+    for lv in range(1, config.hierarchy.n_levels + 1):
+        n_lv = (ns.hierarchy_level == lv).sum().item()
+        print(f'    L{lv}: {n_lv:,} nodes (tau={config.hierarchy.time_scale_factor**(lv-1):.0f}x)', flush=True)
 
     mp = TypedMessagePasser(config, N, device)
     stp = ShortTermPlasticity(config.edges.stp)

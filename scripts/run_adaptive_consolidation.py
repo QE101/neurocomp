@@ -473,7 +473,7 @@ def build_sensory_symbols(input_region, device):
 # LEVEL 2 READOUT
 # ================================================================
 def discover_l2_representations(symbols, graph, ns, mp, device, theta, stp, hom, ip,
-                                 tau_mult, l2_exc_idx, steps=100, top_k=200):
+                                 tau_mult, l2_exc_idx, steps=100, top_k=l2_top_k):
     l2_reps = {}
     for name, pattern in symbols.items():
         for s in range(steps):
@@ -836,16 +836,23 @@ def main():
     print(f'  Total: {graph.n_edges():,} edges (+{n_sw:,} SW, +{n_recurrent:,} recurrent)', flush=True)
     print(builder.summary(graph), flush=True)
 
-    # Use L3 as the abstraction readout level (4K nodes — enough for per-symbol reps)
-    # L4 (1.2K) and L5 (800) are too sparse for top_k=200 readout
-    READOUT_LEVEL = min(3, config.hierarchy.n_levels)
-    l2_exc_idx = torch.where(
-        ns.type_mask(NodeType.EXCITATORY) & (ns.hierarchy_level == READOUT_LEVEL)
-    )[0]
-    print(f'  Readout level {READOUT_LEVEL}: {l2_exc_idx.shape[0]:,} excitatory nodes', flush=True)
+    # Multi-level readout: probe L3, L4, L5 (scale top_k to level size)
+    readout_levels = {}
     for lv in range(1, config.hierarchy.n_levels + 1):
-        n_lv = (ns.hierarchy_level == lv).sum().item()
-        print(f'    L{lv}: {n_lv:,} nodes (tau={config.hierarchy.time_scale_factor**(lv-1):.0f}x)', flush=True)
+        lv_idx = torch.where(
+            ns.type_mask(NodeType.EXCITATORY) & (ns.hierarchy_level == lv)
+        )[0]
+        n_lv = lv_idx.shape[0]
+        tau = config.hierarchy.time_scale_factor ** (lv - 1)
+        print(f'    L{lv}: {n_lv:,} nodes (tau={tau:.0f}x)', flush=True)
+        if lv >= 3:  # readout from L3+
+            top_k = min(200, n_lv // 3)  # scale top_k to level size
+            readout_levels[lv] = (lv_idx, top_k)
+            print(f'      -> readout enabled (top_k={top_k})', flush=True)
+    # Primary readout for discrimination tests (L3 has enough nodes)
+    primary_readout = min(3, config.hierarchy.n_levels)
+    l2_exc_idx = readout_levels[primary_readout][0]
+    l2_top_k = readout_levels[primary_readout][1]
 
     mp = TypedMessagePasser(config, N, device)
     stp = ShortTermPlasticity(config.edges.stp)
@@ -925,7 +932,7 @@ def main():
     # Initial L2 representation discovery
     print(f'\n--- DISCOVERING L2 REPRESENTATIONS ---', flush=True)
     l2_reps = discover_l2_representations(symbols, graph, ns, mp, device, theta, stp, hom, ip,
-                                            tau_mult, l2_exc_idx, steps=100, top_k=200)
+                                            tau_mult, l2_exc_idx, steps=100, top_k=l2_top_k)
     for name in list(symbols.keys())[:3]:
         overlap_count = 0
         for other in symbols:
@@ -1032,7 +1039,7 @@ def main():
             elapsed = time.perf_counter() - t0
 
             l2_reps = discover_l2_representations(symbols, graph, ns, mp, device, theta, stp, hom, ip,
-                                                    tau_mult, l2_exc_idx, steps=50, top_k=200)
+                                                    tau_mult, l2_exc_idx, steps=50, top_k=l2_top_k)
 
             log['epoch'].append(epoch + 1)
             print(f'  Ep {epoch+1:5d} ({pd_steps}st):', flush=True)
@@ -1046,13 +1053,26 @@ def main():
                 log[f'l2_{pname}_disc'].append(l2_d)
                 print(f'    {pname:10s} L1={l1_a:.0f}%/{l1_d:+.1f}%  L2={l2_a:.0f}%/{l2_d:+.1f}%', flush=True)
 
-            # Context probe: does L2 disambiguate a30 based on predecessor?
+            # Higher-level readout (L4, L5 if they exist)
+            for lv, (lv_idx, lv_topk) in readout_levels.items():
+                if lv == primary_readout:
+                    continue  # already measured above as "L2"
+                lv_reps = discover_l2_representations(symbols, graph, ns, mp, device, theta, stp, hom, ip,
+                                                       tau_mult, lv_idx, steps=50, top_k=lv_topk)
+                # Measure hub_c (the hardest probe) at this level
+                _, _, lv_a, lv_d = measure_discrimination_dual(
+                    symbols, probe_sequences['hub_c'], lv_reps, graph, ns, mp, device,
+                    theta, stp, hom, ip, tau_mult, steps=pd_steps)
+                log.setdefault(f'l{lv}_hub_disc', []).append(lv_d)
+                print(f'    L{lv} hub_c  disc={lv_d:+.1f}%', flush=True)
+
+            # Context probe: does any level disambiguate a30 based on predecessor?
             ctx_l1, ctx_l2, ctx_n, ctx_details = measure_context_probe(
                 symbols, l2_reps, graph, ns, mp, device, theta, stp, hom, ip, tau_mult, steps=pd_steps)
             log.setdefault('ctx_l1', []).append(ctx_l1)
             log.setdefault('ctx_l2', []).append(ctx_l2)
             log.setdefault('ctx_n', []).append(ctx_n)
-            ctx_str = f'L1={ctx_l1}/{ctx_n} L2={ctx_l2}/{ctx_n}'
+            ctx_str = f'L1={ctx_l1}/{ctx_n} L3={ctx_l2}/{ctx_n}'
             for tn, td in ctx_details.items():
                 ctx_str += f'  {tn}:{"Y" if td["l2_correct"] else "N"}'
             print(f'    CONTEXT  {ctx_str}', flush=True)
@@ -1090,7 +1110,7 @@ def main():
             novel_symbol_set[name] = symbols[name]
     l2_reps_novel = discover_l2_representations(
         novel_symbol_set, graph, ns, mp, device,
-        theta, stp, hom, ip, tau_mult, l2_exc_idx, steps=100, top_k=200)
+        theta, stp, hom, ip, tau_mult, l2_exc_idx, steps=100, top_k=l2_top_k)
     l2_reps.update(l2_reps_novel)
 
     # Baseline per transfer type
@@ -1126,7 +1146,7 @@ def main():
         if (ep + 1) % 50 == 0:
             l2_reps_novel = discover_l2_representations(
                 novel_symbol_set, graph, ns, mp, device,
-                theta, stp, hom, ip, tau_mult, l2_exc_idx, steps=50, top_k=200)
+                theta, stp, hom, ip, tau_mult, l2_exc_idx, steps=50, top_k=l2_top_k)
             l2_reps.update(l2_reps_novel)
             print(f'  Transfer ep{ep+1}:', flush=True)
             for nkey, nseq in novel_sequences.items():
@@ -1137,7 +1157,7 @@ def main():
     # Final measurement
     l2_reps_novel = discover_l2_representations(
         novel_symbol_set, graph, ns, mp, device,
-        theta, stp, hom, ip, tau_mult, l2_exc_idx, steps=100, top_k=200)
+        theta, stp, hom, ip, tau_mult, l2_exc_idx, steps=100, top_k=l2_top_k)
     l2_reps.update(l2_reps_novel)
 
     # Results summary

@@ -909,8 +909,9 @@ def main():
     _fused = FusedPlasticity(graph, config.edges.stp, mp.delay_buffer)
     print(f'  Fused plasticity: {_fused.n_total:,} edges in {len(_fused.active_types)} types', flush=True)
 
-    # torch.compile: ~1.8x on top of fusion (Linux/WSL only)
-    _fused.enable_compile()
+    # torch.compile disabled — causes CUDA unknown error after sustained runs
+    # Fused + FP16 STP + multi-rate still gives 1.9x without it
+    # _fused.enable_compile()
 
     # Compiled node update
     global _compiled_node, _basal_tau, _apical_tau, _input_norm

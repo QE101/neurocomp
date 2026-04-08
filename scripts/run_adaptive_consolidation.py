@@ -51,6 +51,8 @@ SLEEP_EVERY = 20
 INPUT_FRACTION = 0.20
 SYMBOL_SPARSITY = 0.10
 PAUSE = 20
+STP_EVERY = 5    # multi-rate: STP every 5 steps (tau_f=100ms, safe at 200Hz)
+LEARN_EVERY = 10  # multi-rate: learning every 10 steps (dw ~1e-6/step, negligible drift)
 CHECKPOINT_DIR = Path('checkpoints/adaptive_consolidation')
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -849,8 +851,10 @@ def main():
                     inputs = mp.read_inputs(step)
                     inputs.basal[pattern.long()] += strength
                     error_node_update(ns, inputs, theta_mod=theta.get_modulation(step), tau_mult=tau_mult)
-                    _fused.stp(ns.output)
-                    _fused.learn(ns, _exc_mask, _current_decay, is_replay=False)
+                    if step % STP_EVERY == 0:
+                        _fused.stp(ns.output)
+                    if step % LEARN_EVERY == 0:
+                        _fused.learn(ns, _exc_mask, _current_decay, is_replay=False)
                     if step % 100 == 0:
                         for et in PLASTIC_EDGE_TYPES:
                             if graph.has_edge_type(et):
@@ -988,8 +992,10 @@ def main():
                     inputs = mp.read_inputs(step)
                     inputs.basal[pattern.long()] += get_strength()
                     error_node_update(ns, inputs, theta_mod=theta.get_modulation(step), tau_mult=tau_mult)
-                    _fused.stp(ns.output)
-                    _fused.learn(ns, _exc_mask, _current_decay, is_replay=False)
+                    if step % STP_EVERY == 0:
+                        _fused.stp(ns.output)
+                    if step % LEARN_EVERY == 0:
+                        _fused.learn(ns, _exc_mask, _current_decay, is_replay=False)
                     graph.increment_step()
 
         adapt_decay_rate(graph)

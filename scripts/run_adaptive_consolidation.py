@@ -53,6 +53,8 @@ SYMBOL_SPARSITY = 0.10
 PAUSE = 20
 STP_EVERY = 5    # multi-rate: STP every 5 steps (tau_f=100ms, safe at 200Hz)
 LEARN_EVERY = 10  # multi-rate: learning every 10 steps (dw ~1e-6/step, negligible drift)
+SURPRISE_COEF = 0.5  # additive baseline for upper-level error gate
+REWARD_LR = 0.001  # 3-factor reward learning rate
 CHECKPOINT_DIR = Path('checkpoints/adaptive_consolidation')
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -963,7 +965,7 @@ def main():
 
         for seq_key in epoch_order:
             seq = sequences[seq_key]
-            for name in seq:
+            for sym_idx, name in enumerate(seq):
                 strength = get_strength()
                 pattern = symbols[name]
                 for s in range(pd_steps):
@@ -972,10 +974,14 @@ def main():
                     inputs = mp.read_inputs(step)
                     inputs.basal[pattern.long()] += strength
                     error_node_update(ns, inputs, theta_mod=theta.get_modulation(step), tau_mult=tau_mult)
+                    # Update global surprise from L1 error (amortized)
+                    if step % LEARN_EVERY == 0:
+                        _fused.update_surprise(ns.prediction_error[_exc_mask])
                     if step % STP_EVERY == 0:
                         _fused.stp(ns.output)
                     if step % LEARN_EVERY == 0:
-                        _fused.learn(ns, _exc_mask, _current_decay, is_replay=False)
+                        _fused.learn(ns, _exc_mask, _current_decay, is_replay=False,
+                                     surprise_floor=_fused.surprise_ema * SURPRISE_COEF)
                     if step % 100 == 0:
                         for et in PLASTIC_EDGE_TYPES:
                             if graph.has_edge_type(et):
@@ -983,6 +989,14 @@ def main():
                         ip.update(ns)
                     graph.increment_step()
                 hipp.encode(ns.output, graph.step_count)
+                # Reward signal: did apical predict the next symbol?
+                if sym_idx + 1 < len(seq):
+                    next_pattern = symbols[seq[sym_idx + 1]]
+                    pred_str = ns.apical[next_pattern.long()].mean().item()
+                    rand_idx = torch.randint(0, N, (next_pattern.shape[0],), device=device)
+                    rand_str = ns.apical[rand_idx].mean().item()
+                    reward = 1.0 if pred_str > rand_str * 1.2 else -0.5
+                    _fused.apply_reward(ns.output, reward, reward_lr=REWARD_LR)
 
             for s in range(PAUSE):
                 step = graph.step_count
@@ -1091,7 +1105,7 @@ def main():
             log['decay_rate'].append(_current_decay)
             log['n_edges'].append(graph.n_edges())
 
-            print(f'    echo={hl}st stiff=[{p10:.3f}/{p50:.3f}/{p90:.3f}] decay={_current_decay:.6f} edges={graph.n_edges():,} ({elapsed:.0f}s)', flush=True)
+            print(f'    echo={hl}st stiff=[{p10:.3f}/{p50:.3f}/{p90:.3f}] decay={_current_decay:.6f} surprise={_fused.surprise_ema:.4f} edges={graph.n_edges():,} ({elapsed:.0f}s)', flush=True)
 
         # Checkpoint
         if (epoch + 1) % CHECKPOINT_EVERY == 0:
@@ -1131,7 +1145,7 @@ def main():
         np.random.shuffle(novel_order)
         for nkey in novel_order:
             nseq = novel_sequences[nkey]
-            for name in nseq:
+            for sym_idx, name in enumerate(nseq):
                 pattern = symbols[name]
                 for s in range(50):
                     step = graph.step_count
@@ -1139,11 +1153,22 @@ def main():
                     inputs = mp.read_inputs(step)
                     inputs.basal[pattern.long()] += get_strength()
                     error_node_update(ns, inputs, theta_mod=theta.get_modulation(step), tau_mult=tau_mult)
+                    if step % LEARN_EVERY == 0:
+                        _fused.update_surprise(ns.prediction_error[_exc_mask])
                     if step % STP_EVERY == 0:
                         _fused.stp(ns.output)
                     if step % LEARN_EVERY == 0:
-                        _fused.learn(ns, _exc_mask, _current_decay, is_replay=False)
+                        _fused.learn(ns, _exc_mask, _current_decay, is_replay=False,
+                                     surprise_floor=_fused.surprise_ema * SURPRISE_COEF)
                     graph.increment_step()
+                # Reward signal
+                if sym_idx + 1 < len(nseq):
+                    next_pattern = symbols[nseq[sym_idx + 1]]
+                    pred_str = ns.apical[next_pattern.long()].mean().item()
+                    rand_idx = torch.randint(0, N, (next_pattern.shape[0],), device=device)
+                    rand_str = ns.apical[rand_idx].mean().item()
+                    reward = 1.0 if pred_str > rand_str * 1.2 else -0.5
+                    _fused.apply_reward(ns.output, reward, reward_lr=REWARD_LR)
 
         adapt_decay_rate(graph)
 

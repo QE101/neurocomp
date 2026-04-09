@@ -119,7 +119,33 @@ class FusedPlasticity:
         self.tau_d = stp_cfg.tau_depression
         self._compiled = False
         self._fp16_stp = fp16_stp
+        # Global surprise: smoothed L1 prediction error magnitude
+        # Acts as additive baseline for learning when local error vanishes
+        self.surprise_ema = 0.0
+        self.surprise_decay = 0.995  # 200-step smoothing
         self._build(graph)
+
+    def update_surprise(self, l1_pred_err):
+        """Update global surprise from L1 prediction error magnitude.
+
+        Called once per step. The EMA acts as a baseline arousal signal
+        that prevents upper-level learning from collapsing when L1 succeeds.
+        """
+        l1_mag = l1_pred_err.abs().mean().item()
+        self.surprise_ema = self.surprise_decay * self.surprise_ema + (1 - self.surprise_decay) * l1_mag
+
+    def apply_reward(self, output, reward, reward_lr=0.001):
+        """3-factor reward learning: dw = lr * reward * pre_trace * dst_activity.
+
+        Synapses with high pre_trace (recently fired source) and active dst
+        get rewarded. Standard dopamine-modulated STDP.
+        """
+        if self.n_total == 0 or abs(reward) < 1e-4:
+            return
+        torch.index_select(output, 0, self.f_dst64, out=self.f_dst_out)
+        # dw = lr * reward * pre_trace * dst
+        dw = reward_lr * reward * self.f_pre_trace * self.f_dst_out
+        self.f_weight.add_(dw).clamp_(0.0, 1.0)
 
     def _build(self, graph: NeuromorphicGraph):
         """Build fused buffers and replace EdgeStore fields with views."""
@@ -247,8 +273,15 @@ class FusedPlasticity:
             self.f_release_prob.clamp_(0.0, 1.0)
 
     def learn(self, node_state, exc_mask: Tensor, current_decay: float,
-              is_replay: bool = False, lr_scale: float = 1.0):
-        """Fused learning with adaptive consolidation."""
+              is_replay: bool = False, lr_scale: float = 1.0,
+              surprise_floor: float = 0.0):
+        """Fused learning with adaptive consolidation.
+
+        Args:
+            surprise_floor: additive baseline added to dst error magnitude.
+                Prevents upper-level learning from collapsing when local
+                error vanishes. Typically self.surprise_ema * 0.5.
+        """
         if self.n_total == 0:
             return
 
@@ -261,7 +294,10 @@ class FusedPlasticity:
         src = self.f_src_out
         dst = self.f_dst_out
 
-        pred_err_dst = pred_err[self.f_dst64]
+        # pred_err_dst with surprise floor (already absolute valued)
+        pred_err_dst = pred_err[self.f_dst64].abs()
+        if surprise_floor > 0:
+            pred_err_dst = pred_err_dst + surprise_floor
 
         if self._compiled and not is_replay:
             self._learn_fn(self.f_pre_trace, self.f_post_trace, self.f_weight,
@@ -275,8 +311,8 @@ class FusedPlasticity:
             self.f_post_trace.addcmul_(src, dst, value=0.0001)
             self.f_post_trace.clamp_(0.0, 1.0)
 
-            dst_error = pred_err_dst.abs()
-            error_gate = (dst_error / global_novelty).clamp_(0.0, 3.0)
+            # pred_err_dst already abs'd above
+            error_gate = (pred_err_dst / global_novelty).clamp_(0.0, 3.0)
             error_signal = torch.sigmoid((error_gate - 2.0) * 2.0)
             unconsolidate = error_signal.mul_(0.0001).mul_(self.f_post_trace).mul_(self.f_post_trace)
             self.f_post_trace.sub_(unconsolidate).clamp_(0.0, 1.0)

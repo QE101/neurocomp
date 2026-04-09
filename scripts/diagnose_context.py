@@ -162,71 +162,52 @@ def main():
     mp.delay_buffer.reset()
 
     contexts = ['a26', 'a28', 'a31']
-    snapshots = {}
 
-    for ctx in contexts:
-        # Cool down between contexts to remove residue
-        cooldown(ns, graph, mp, theta, tau_mult, steps=50)
-        # Reset basal/apical between contexts (simulate fresh start)
-        ns.basal.zero_(); ns.apical.zero_()
-        snap = run_context_test(ns, graph, mp, theta, tau_mult, fused,
-                                 rac._exc_mask, symbols, ctx, steps=100)
-        snapshots[ctx] = snap
-        print(f"  {ctx} -> a30: done", flush=True)
-
-    # ================================================================
-    # Compare snapshots per level
-    # ================================================================
-    print("\n" + "=" * 60)
-    print("  PER-LEVEL CONTEXT DIFFERENCES")
-    print("=" * 60)
-    print(f"\n  {'Level':<8} {'metric':<12} {'a26 vs a28':>12} {'a26 vs a31':>12} {'a28 vs a31':>12}")
-    print(f"  {'-'*8} {'-'*12} {'-'*12} {'-'*12} {'-'*12}")
-
-    for lv in range(1, config.hierarchy.n_levels + 1):
-        mask = level_masks[lv]
-        n_lv = mask.sum().item()
-        if n_lv == 0:
-            continue
-
-        # Compare basal patterns (representation of "input I'm processing")
-        for field in ['basal', 'apical', 'output']:
-            patterns = {ctx: snapshots[ctx][field][mask] for ctx in contexts}
-
-            # Cosine similarity (closer to 1 = identical, closer to 0 = orthogonal)
-            def cos_sim(a, b):
-                if a.norm() < 1e-6 or b.norm() < 1e-6:
-                    return 0.0
-                return F.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()
-
-            sim_ab = cos_sim(patterns['a26'], patterns['a28'])
-            sim_ac = cos_sim(patterns['a26'], patterns['a31'])
-            sim_bc = cos_sim(patterns['a28'], patterns['a31'])
-
-            # Convert to "differentiation" — 1 - similarity
-            diff_ab = 1 - sim_ab
-            diff_ac = 1 - sim_ac
-            diff_bc = 1 - sim_bc
-
-            print(f"  L{lv:<7} {field:<12} {diff_ab:>12.4f} {diff_ac:>12.4f} {diff_bc:>12.4f}")
-
-        # L2 norm magnitude per level (is the level even active?)
+    # Test BOTH timings: slow (100 steps) and fast (5 steps)
+    for label, steps in [('SLOW (100 steps)', 100), ('FAST (5 steps)', 5)]:
+        print(f"\n--- {label} ---", flush=True)
+        snapshots = {}
         for ctx in contexts:
-            mag = snapshots[ctx]['output'][mask].abs().mean().item()
-        print()
+            cooldown(ns, graph, mp, theta, tau_mult, steps=50)
+            ns.basal.zero_(); ns.apical.zero_()
+            snap = run_context_test(ns, graph, mp, theta, tau_mult, fused,
+                                     rac._exc_mask, symbols, ctx, steps=steps)
+            snapshots[ctx] = snap
+            print(f"  {ctx} -> a30: done", flush=True)
+
+        compare_snapshots(snapshots, level_masks, contexts, config.hierarchy.n_levels)
 
     print("\n" + "=" * 60)
     print("  INTERPRETATION")
     print("=" * 60)
     print("""
-  diff = 0.00 -> patterns are identical (no context encoding at this level)
-  diff = 0.01-0.05 -> tiny differences (substrate sees context but readout can't)
-  diff = 0.05-0.20 -> moderate differentiation (substrate works, learning rule needs work)
-  diff > 0.20 -> strong differentiation (something is encoding context, find what)
-
-  Look at the apical column especially — that's where top-down predictions live.
-  If apical patterns differ across contexts, the graph IS encoding context somewhere.
+  diff = 0.00 -> patterns identical (no context encoding)
+  diff = 0.01-0.05 -> tiny differences (substrate sees, readout can't)
+  diff = 0.05-0.20 -> moderate (substrate works, learning rule weak)
+  diff > 0.20 -> strong differentiation
 """)
+
+
+def compare_snapshots(snapshots, level_masks, contexts, n_levels):
+    print(f"\n  {'Level':<8} {'metric':<12} {'a26 vs a28':>12} {'a26 vs a31':>12} {'a28 vs a31':>12}")
+    print(f"  {'-'*8} {'-'*12} {'-'*12} {'-'*12} {'-'*12}")
+
+    def cos_sim(a, b):
+        if a.norm() < 1e-6 or b.norm() < 1e-6:
+            return 0.0
+        return F.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()
+
+    for lv in range(1, n_levels + 1):
+        mask = level_masks[lv]
+        if mask.sum().item() == 0:
+            continue
+        for field in ['basal', 'apical', 'output']:
+            patterns = {ctx: snapshots[ctx][field][mask] for ctx in contexts}
+            diff_ab = 1 - cos_sim(patterns['a26'], patterns['a28'])
+            diff_ac = 1 - cos_sim(patterns['a26'], patterns['a31'])
+            diff_bc = 1 - cos_sim(patterns['a28'], patterns['a31'])
+            print(f"  L{lv:<7} {field:<12} {diff_ab:>12.4f} {diff_ac:>12.4f} {diff_bc:>12.4f}")
+        print()
 
 
 if __name__ == '__main__':

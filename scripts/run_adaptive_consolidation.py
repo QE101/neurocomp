@@ -50,7 +50,7 @@ CHECKPOINT_EVERY = 50
 SLEEP_EVERY = 5  # more frequent sleep — consolidation needs it for 5-level hierarchy
 INPUT_FRACTION = 0.20
 SYMBOL_SPARSITY = 0.10
-PAUSE = 20
+PAUSE = 5  # was 20 — short pause for fast-pacing curriculum
 STP_EVERY = 5    # multi-rate: STP every 5 steps (tau_f=100ms, safe at 200Hz)
 LEARN_EVERY = 10  # multi-rate: learning every 10 steps (dw ~1e-6/step, negligible drift)
 SURPRISE_COEF = 0.5  # additive baseline for upper-level error gate
@@ -127,9 +127,11 @@ def cache_type_masks(ns):
     _pv_f = _pv_mask.float()
 
 def get_presentation_steps(epoch):
-    if epoch < 300: return 100
-    elif epoch < 700: return 50
-    else: return 30
+    # Fast pacing: tau=10 means context residue dies after ~30 steps
+    # 5 steps per symbol keeps context alive across the next symbol's basal update
+    if epoch < 300: return 8
+    elif epoch < 700: return 6
+    else: return 5
 
 def get_strength():
     return 1.0 + np.random.random() * 2.0
@@ -852,8 +854,9 @@ def main():
             top_k = min(200, n_lv // 3)  # scale top_k to level size
             readout_levels[lv] = (lv_idx, top_k)
             print(f'      -> readout enabled (top_k={top_k})', flush=True)
-    # Primary readout for discrimination tests (L3 has enough nodes)
-    primary_readout = min(3, config.hierarchy.n_levels)
+    # Primary readout: L5 (highest abstraction, where context lives per diagnostic)
+    # Diagnostic showed L5 output differentiates 0.15 across contexts at fast pacing
+    primary_readout = config.hierarchy.n_levels  # = 5 in 5-level config
     l2_exc_idx = readout_levels[primary_readout][0]
     l2_top_k = readout_levels[primary_readout][1]
 

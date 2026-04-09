@@ -51,8 +51,10 @@ SLEEP_EVERY = 5  # more frequent sleep — consolidation needs it for 5-level hi
 INPUT_FRACTION = 0.20
 SYMBOL_SPARSITY = 0.10
 PAUSE = 5  # was 20 — short pause for fast-pacing curriculum
-STP_EVERY = 5    # multi-rate: STP every 5 steps (tau_f=100ms, safe at 200Hz)
-LEARN_EVERY = 10  # multi-rate: learning every 10 steps (dw ~1e-6/step, negligible drift)
+# Multi-rate disabled at fast pacing — savings are negligible (12x fewer steps already)
+# AND the consolidation system needs ~500+ learn calls per epoch to balance properly
+STP_EVERY = 1
+LEARN_EVERY = 1
 SURPRISE_COEF = 0.5  # additive baseline for upper-level error gate
 REWARD_LR = 0.001  # 3-factor reward learning rate
 CHECKPOINT_DIR = Path('checkpoints/adaptive_consolidation')

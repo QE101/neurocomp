@@ -160,7 +160,7 @@ CONFIG_50K = {
     'hierarchy': {
         'enabled': True, 'n_levels': 5, 'split_axis': 2,
         'level_split': [0.60, 0.25, 0.10, 0.03, 0.02],  # pyramidal: 24K/10K/4K/1.2K/800 exc
-        'time_scale_factor': 2.0, 'inter_level_k': 5,    # 2.0x per level (L5 = 16x slower)
+        'time_scale_factor': 2.0, 'inter_level_k': 25,   # was 5 — denser inter-level wiring
         'inter_level_sigma': 0.5, 'inter_level_init_weight': 0.02,
     },
     'hippocampal': {

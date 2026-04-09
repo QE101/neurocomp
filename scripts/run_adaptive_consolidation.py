@@ -640,25 +640,23 @@ def measure_echo_persistence(symbols, name, graph, ns, mp, device, theta, tau_mu
     return half_life, activity_trace
 
 
-def measure_context_probe(symbols, l2_reps, graph, ns, mp, device,
+def measure_context_probe(symbols, level_reps, graph, ns, mp, device,
                           theta, stp, hom, ip, tau_mult, steps=50):
-    """Test whether L2 uses sequential context to disambiguate hub symbol a30.
+    """Test whether each level uses sequential context to disambiguate a30.
 
     a30 has 3 different successors depending on context:
       hub_a: a26 -> a30 -> a27
       hub_b: a28 -> a30 -> a29
       hub_c: a31 -> a30 -> a32 -> a33
 
-    For each context, we:
-      1. Present the predecessor for `steps` steps (prime context)
-      2. Present a30 for `steps` steps
-      3. Read L2 apical predictions at all 3 successor locations
-      4. Check if the correct successor gets the highest prediction
+    For each context, prime with predecessor, present a30, read predictions
+    at each level. If a level learned context, the correct successor wins.
 
-    If L2 learned context: correct successor wins in each case.
-    If L2 just memorised "a30 predicts X": same winner regardless of context.
+    Args:
+        level_reps: dict {level: reps_dict} where reps_dict is {symbol: node_indices}.
+                    Always includes 1 (sensory L1).
 
-    Returns: (n_correct, n_tested, details_dict)
+    Returns: (n_correct_per_level dict, n_tested, details_dict)
     """
     hub_tests = [
         ('hub_a', 'a26', 'a30', 'a27', ['a29', 'a32']),
@@ -666,16 +664,23 @@ def measure_context_probe(symbols, l2_reps, graph, ns, mp, device,
         ('hub_c', 'a31', 'a30', 'a32', ['a27', 'a29']),
     ]
 
-    n_correct_l1 = 0
-    n_correct_l2 = 0
+    n_correct = {lv: 0 for lv in level_reps}
     n_tested = 0
     details = {}
 
     for test_name, ctx_name, hub_name, correct_name, wrong_names in hub_tests:
-        # Check all symbols exist in l2_reps
         all_names = [correct_name] + wrong_names
-        missing = [n for n in all_names if n not in l2_reps]
-        if missing or hub_name not in symbols or ctx_name not in symbols:
+        if hub_name not in symbols or ctx_name not in symbols:
+            continue
+        # Check all successors have reps at every level
+        skip = False
+        for lv, reps in level_reps.items():
+            if lv == 1:
+                continue  # L1 uses raw symbols
+            if any(n not in reps for n in all_names):
+                skip = True
+                break
+        if skip:
             continue
 
         ctx_pattern = symbols[ctx_name]
@@ -706,19 +711,18 @@ def measure_context_probe(symbols, l2_reps, graph, ns, mp, device,
             _fused.stp(ns.output)
             graph.increment_step()
 
-        # Step 3: Read predictions (apical activation at each successor)
-        # L1: apical at symbol's sensory nodes
-        ap_l1 = {}
-        for name in all_names:
-            ap_l1[name] = ns.apical[symbols[name].long()].mean().item()
+        # Step 3: Read predictions at every level
+        ap_per_level = {}
+        for lv, reps in level_reps.items():
+            ap = {}
+            for name in all_names:
+                if lv == 1:
+                    ap[name] = ns.apical[symbols[name].long()].mean().item()
+                else:
+                    ap[name] = ns.apical[reps[name].long()].mean().item()
+            ap_per_level[lv] = ap
 
-        # L2: apical at successor's L2 representation
-        ap_l2 = {}
-        for name in all_names:
-            if name in l2_reps:
-                ap_l2[name] = ns.apical[l2_reps[name].long()].mean().item()
-
-        # Step 4: Cool down (prevent bleeding between tests)
+        # Step 4: Cool down
         for s in range(20):
             step = graph.step_count
             dual_channel_send(ns, graph, mp, device)
@@ -726,23 +730,20 @@ def measure_context_probe(symbols, l2_reps, graph, ns, mp, device,
             error_node_update(ns, inputs, theta_mod=theta.get_modulation(step), tau_mult=tau_mult)
             graph.increment_step()
 
-        # Score: does the correct successor get the highest prediction?
-        l1_winner = max(ap_l1, key=ap_l1.get) if ap_l1 else None
-        l2_winner = max(ap_l2, key=ap_l2.get) if ap_l2 else None
-        l1_correct = l1_winner == correct_name
-        l2_correct = l2_winner == correct_name
-        n_correct_l1 += int(l1_correct)
-        n_correct_l2 += int(l2_correct)
-        n_tested += 1
+        winners = {}
+        for lv, ap in ap_per_level.items():
+            winner = max(ap, key=ap.get)
+            winners[lv] = winner
+            if winner == correct_name:
+                n_correct[lv] += 1
 
+        n_tested += 1
         details[test_name] = {
-            'context': ctx_name, 'hub': hub_name,
-            'correct': correct_name, 'l1_winner': l1_winner, 'l2_winner': l2_winner,
-            'l1_correct': l1_correct, 'l2_correct': l2_correct,
-            'l1_scores': ap_l1, 'l2_scores': ap_l2,
+            'context': ctx_name, 'hub': hub_name, 'correct': correct_name,
+            'winners': winners, 'scores': ap_per_level,
         }
 
-    return n_correct_l1, n_correct_l2, n_tested, details
+    return n_correct, n_tested, details
 
 
 def get_stiffness_stats(graph):
@@ -1057,27 +1058,27 @@ def main():
                 log[f'l{primary_readout}_{pname}_disc'].append(l3_d)
                 print(f'    {pname:10s} L1={l1_a:.0f}%/{l1_d:+.1f}%  L{primary_readout}={l3_a:.0f}%/{l3_d:+.1f}%', flush=True)
 
-            # All other readout levels (L2, L4, L5)
+            # All other readout levels (L2, L4, L5) — keep reps for context probe
+            all_level_reps = {1: None, primary_readout: l2_reps}
             for lv, (lv_idx, lv_topk) in readout_levels.items():
                 if lv == primary_readout:
                     continue
                 lv_reps = discover_l2_representations(symbols, graph, ns, mp, device, theta, stp, hom, ip,
                                                        tau_mult, lv_idx, steps=50, top_k=lv_topk)
+                all_level_reps[lv] = lv_reps
                 _, _, lv_a, lv_d = measure_discrimination_dual(
                     symbols, probe_sequences['hub_c'], lv_reps, graph, ns, mp, device,
                     theta, stp, hom, ip, tau_mult, steps=pd_steps)
                 log.setdefault(f'l{lv}_hub_disc', []).append(lv_d)
                 print(f'    L{lv} hub_c  disc={lv_d:+.1f}%', flush=True)
 
-            # Context probe: does any level disambiguate a30 based on predecessor?
-            ctx_l1, ctx_l2, ctx_n, ctx_details = measure_context_probe(
-                symbols, l2_reps, graph, ns, mp, device, theta, stp, hom, ip, tau_mult, steps=pd_steps)
-            log.setdefault('ctx_l1', []).append(ctx_l1)
-            log.setdefault('ctx_l2', []).append(ctx_l2)
+            # Context probe: which level disambiguates a30 based on predecessor?
+            ctx_correct, ctx_n, ctx_details = measure_context_probe(
+                symbols, all_level_reps, graph, ns, mp, device, theta, stp, hom, ip, tau_mult, steps=pd_steps)
+            for lv, n in ctx_correct.items():
+                log.setdefault(f'ctx_l{lv}', []).append(n)
             log.setdefault('ctx_n', []).append(ctx_n)
-            ctx_str = f'L1={ctx_l1}/{ctx_n} L{primary_readout}={ctx_l2}/{ctx_n}'
-            for tn, td in ctx_details.items():
-                ctx_str += f'  {tn}:{"Y" if td["l2_correct"] else "N"}'
+            ctx_str = '  '.join(f'L{lv}={n}/{ctx_n}' for lv, n in sorted(ctx_correct.items()))
             print(f'    CONTEXT  {ctx_str}', flush=True)
 
             hl, _ = measure_echo_persistence(symbols, 'a01', graph, ns, mp, device, theta, tau_mult, steps=pd_steps)

@@ -3135,9 +3135,106 @@ Initial profiling revealed message passing was only 17% of step time — the wro
 - `scripts/bench_fp16.py` — FP16 mixed precision benchmark
 - `scripts/profile_step_fused.py` — end-to-end old vs fused
 
+## Session 11 — 2026-04-08/09: Rich Curriculum + Deep Hierarchy + Diagnostic Breakthrough
+
+### Rich Curriculum Design
+
+Replaced 3-sequence curriculum (15 symbols) with 14 sequences (48 symbols, 5 categories):
+- **Simple chains**: 3/5/7-item sequences (baselines)
+- **Shared bigrams**: a02→a03 and a06→a07 appear in 3 sequences each
+- **Hub symbol**: a30 has 3 different successors (a27/a29/a32) depending on context (a26/a28/a31 predecessor)
+- **Internal repetition**: same symbol at multiple positions within a sequence
+- **Chunk reuse**: [a42,a43] appears as a unit in 2 sequences
+
+5 transfer test types: pure novel, reorder, bigram transfer, chunk transfer, hub adaptation.
+
+**Context disambiguation probe**: present predecessor→a30, measure which successor L2 predicts. 3/3 = genuine context encoding. 1/3 = chance (memorisation).
+
+### 2-Level Run Results (1000 epochs, ~3.7 hours on 3080 Ti)
+
+- Context probe: **stuck at 1/3** throughout. L2 never disambiguated a30.
+- L1 learned well: hub_c peaked +31.7%, chunk_b +27%, share_b +30%
+- L1 then REGRESSED (catastrophic forgetting across 14 sequences)
+- Transfer: novel_pure +5.0%, novel_chunk +5.4% (positive). novel_hub -4.4% (failed).
+- Consolidation: perfect. p50=0.37, decay stable at 0.9997.
+- **Conclusion**: Graph learned sequential structure but NOT context-dependent prediction.
+
+### 5-Level Pyramid Hierarchy
+
+Hypothesis: 2 levels insufficient for context. Added 5 levels with pyramidal split:
+- L1: 24K (60%), L2: 10K (25%), L3: 4K (10%), L4: 1.2K (3%), L5: 800 (2%)
+- Time constants: 2.0x per level (L5 = 16x slower than L1)
+- Inter-level connectivity: initially k=5, later increased to k=25
+- Sleep: SLEEP_EVERY=5 (4x more frequent than original 20)
+
+### 5-Level Run Results (H100 cloud, Vast.ai)
+
+**First run (k=5 inter-level)**: L4/L5 completely inert through 750 epochs. Context 1/3 everywhere.
+
+**Second run (k=25 inter-level)**: L2 hub_c climbed 3.9→7.8→8.2→10.5% (best ever). Then COLLAPSED to -3.4% when pd_steps dropped from 100 to 50 at epoch 300. L1 was learning so well it ate L2's error signal.
+
+### Surprise + Reward Modulation
+
+Added to fix L2 collapse:
+- **Surprise**: smoothed L1 prediction error magnitude. Added as baseline floor to learning's error_gate. Prevents upper-level plasticity from collapsing when L1 succeeds.
+- **Reward**: 3-factor STDP (pre_trace × dst_activity × reward). Computed after each symbol: did apical predict the next symbol correctly? +1.0 for correct, -0.5 for wrong.
+
+**Result (1000 epochs on H100)**: L2 peaked at +15.1% but still oscillated. Context probe stuck at 1/3 across all 5 levels for the entire run. Surprise floor stayed at ~17.5 (never collapsed, but also never differentiated). L1 results wildly unstable at pd_steps=30 (+30%↔-22%).
+
+### THE DIAGNOSTIC BREAKTHROUGH
+
+**diagnose_context.py**: Present each context predecessor→a30, snapshot basal/apical/output at every level, compare across contexts.
+
+**SLOW timing (100 steps per symbol)**:
+- Basal = 0.0000 across ALL 5 levels. Context completely erased.
+- Apical/output: <0.005 differentiation. Noise floor.
+- **Root cause**: basal tau=10, after 100 steps of a30 input, exp(-100/10)=0.000045. The predecessor's trace is mathematically annihilated. This cascades up — every level reads from the level below, which has already forgotten.
+
+**FAST timing (5 steps per symbol)**:
+- L1 basal: **0.20 differentiation** (strong context signal!)
+- L5 output: **0.15 differentiation** (highest anywhere)
+- L2/L3/L4 basal: 0.001-0.016 (moderate)
+
+**The architecture was holding context all along.** We measured it after the memory had decayed. Every failed run was training with 100-step presentations that mathematically erased context before the hub was even presented. The diagnostic answered in 60 seconds what 4 expensive runs couldn't.
+
+### Fast Pacing Curriculum
+
+Changed pd_steps from 100/50/30 to 8/6/5. Epochs ~12x faster.
+
+**Problem**: multi-rate (LEARN_EVERY=10) gave too few learn calls per epoch (~56 vs ~700), causing consolidation runaway (stiffness saturated to 1.0 by epoch 50). Fixed by disabling multi-rate (LEARN_EVERY=1, STP_EVERY=1).
+
+**Problem**: WSL CUDA driver crashes on sustained runs (3+ crashes). FP16 mixed precision + high GPU utilization + long runs → CUDA unknown error. The same code runs fine on cloud Linux.
+
+### Current State
+
+- Fast pacing ready (pd_steps=8/6/5) but untested end-to-end due to WSL crashes
+- Architecture confirmed to support context encoding at fast pacing
+- Surprise + reward modulation implemented
+- 5-level pyramid with k=25 inter-level wiring
+- Primary readout set to L5 (where context lives per diagnostic)
+- **Blocked on**: stable Linux environment (planning Pop!_OS dual boot)
+
+### Key Insights
+
+- **Basal decay is the fundamental bottleneck for context**: tau=10 erases information in ~30 steps. Any curriculum with pd_steps>30 cannot encode context across symbols.
+- **The probe was right, the pacing was wrong**: L5 0.15 differentiation at 5 steps proves the substrate works. Context-dependent prediction is physically possible in this architecture.
+- **L2 (2x tau) is the natural abstraction layer**: consistently showed the best hub discrimination before it collapsed.
+- **Surprise floor stabilises surprise EMA but doesn't differentiate it**: 17.5 throughout means it's a constant baseline, not an adaptive signal. May need different computation.
+- **WSL is unreliable for sustained GPU workloads**: 3 crashes in 2 days. Cloud or native Linux required for real experiments.
+- **Multi-rate is pacing-dependent**: rates tuned for slow pacing break at fast pacing. Call count per epoch must match the consolidation system's operating regime.
+- **Still unresolved**: whether recurrent loops at upper levels (active maintenance) would allow slow pacing to work. That's option 1 from the diagnostic analysis — not yet tested.
+
+### Files
+
+- `scripts/run_adaptive_consolidation.py` — main training (rich curriculum, 5-level, surprise+reward, fast pacing)
+- `scripts/diagnose_context.py` — context disambiguation diagnostic (THE key tool)
+- `graph_brain/engine/fused_plasticity.py` — surprise_ema, apply_reward, surprise_floor
+- `graph_brain/hierarchy.py` — custom level_split support
+- `graph_brain/config.py` — level_split config option
+
 ### What's Next
 
-1. **Curriculum design**: many diverse sequences to enable L2 abstraction
-2. **3-4 level hierarchy**: deeper abstraction with matched time constants
-3. **RL credit assignment**: long-horizon reward for eventual trading application
-4. **N=500K scaling**: when curriculum demands it, the engine optimizations scale up further
+1. **Test fast pacing on stable Linux** (Pop!_OS dual boot or cloud) — first priority
+2. **Recurrent self-excitation at L4/L5** — active maintenance for context (option 1 from diagnostic)
+3. **RL with explicit task reward** — go beyond "did you predict correctly" to domain-specific objectives
+4. **Trading application** — feed market data as temporal sequences once context works
